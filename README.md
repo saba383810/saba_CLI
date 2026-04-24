@@ -23,20 +23,50 @@ palette.
 
 ## Install
 
+### One-shot install (recommended, fish shell)
+
+```fish
+./install.fish          # install — adds bin/ to $fish_user_paths + installs completions
+./install.fish --check  # dry-run: show what would change
+./install.fish --uninstall
+```
+
+What it does (idempotent, re-runnable):
+
+1. Checks `python3` and `git` are available.
+2. Makes `bin/saba-cli` executable and adds `bin/` to the **universal**
+   `$fish_user_paths` so it persists across shell restarts and new tabs.
+3. Installs tab completions to `~/.config/fish/completions/saba-cli.fish`.
+
+After install, open a new fish tab (or run `exec fish`) and `saba-cli` is
+on your `$PATH`, with `saba-cli --<Tab>` suggesting flags.
+
 ### Quick try (no install)
 
 ```bash
 ./bin/saba-cli --tree
 ```
 
-### As a proper command
+### As a proper command via pip
 
 ```bash
 pip install -e .
 saba-cli --tree
 ```
 
-### Put it on your `$PATH` without pip
+This also wires up `saba-cli` as a console script via `pyproject.toml` —
+handy if you want to install it into a virtualenv.
+
+### Other shells
+
+Put the repo's `bin/` on your `$PATH` manually:
+
+```bash
+# bash / zsh
+echo 'export PATH="'"$PWD"'/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
+```
+
+or symlink it:
 
 ```bash
 ln -s "$PWD/bin/saba-cli" /usr/local/bin/saba-cli
@@ -79,6 +109,9 @@ Refs are parsed and colored by kind:
 saba_cli/
 ├── bin/
 │   └── saba-cli              # dependency-free launcher
+├── completions/
+│   └── saba-cli.fish         # fish tab-completions
+├── install.fish              # one-shot installer for the fish shell
 ├── src/
 │   └── saba_cli/
 │       ├── __init__.py
