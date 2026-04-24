@@ -152,3 +152,12 @@ def count_commits(cwd: Path | None = None) -> int:
         return int(out or "0")
     except GitError:
         return 0
+
+
+def list_remotes(cwd: Path | None = None) -> list[str]:
+    """Return configured remote names (e.g. ['origin', 'upstream'])."""
+    try:
+        out = run_git(["remote"], cwd=cwd)
+    except GitError:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]

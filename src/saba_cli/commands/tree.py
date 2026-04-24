@@ -32,7 +32,7 @@ class Ref:
     label: str   # display text
 
 
-def _parse_refs(raw: str) -> list[Ref]:
+def _parse_refs(raw: str, remotes: list[str]) -> list[Ref]:
     """Parse git's %D output into typed refs.
 
     Example inputs:
@@ -40,10 +40,15 @@ def _parse_refs(raw: str) -> list[Ref]:
         "HEAD -> main, origin/main, tag: v1.0"
         "HEAD, tag: v0.2"
         "origin/feature/foo"
+
+    ``remotes`` is used to tell remote-tracking refs apart from local
+    branches that simply contain a ``/`` (e.g. ``feature/x``).
     """
     refs: list[Ref] = []
     if not raw.strip():
         return refs
+
+    remote_prefixes = tuple(f"{r}/" for r in remotes)
 
     for piece in (p.strip() for p in raw.split(",")):
         if not piece:
@@ -55,8 +60,7 @@ def _parse_refs(raw: str) -> list[Ref]:
             refs.append(Ref(kind="head", label="HEAD"))
         elif piece.startswith("tag: "):
             refs.append(Ref(kind="tag", label=piece[len("tag: "):].strip()))
-        elif "/" in piece and not piece.startswith("refs/"):
-            # assume "remote/branch" shape
+        elif remote_prefixes and piece.startswith(remote_prefixes):
             refs.append(Ref(kind="remote", label=piece))
         else:
             refs.append(Ref(kind="local", label=piece))
@@ -201,9 +205,10 @@ def run(args) -> int:
 
     hash_width = max((len(c.short_hash) for c in commits), default=7)
 
+    remotes = git.list_remotes(cwd=repo_root)
     refs_list: list[tuple[str, int]] = []  # (colored, raw_width) per commit
     for c in commits:
-        refs_list.append(_render_refs(_parse_refs(c.refs)))
+        refs_list.append(_render_refs(_parse_refs(c.refs, remotes)))
     refs_width = max((w for _, w in refs_list), default=0)
 
     date_width = max((len(c.rel_date) for c in commits), default=0)
