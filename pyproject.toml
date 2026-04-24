@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saba-cli"
+version = "0.1.0"
+description = "A personal toolbelt of handy CLI utilities, starting with a pretty git tree."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "saba383810" }]
+keywords = ["cli", "git", "tree", "iceberg", "devtools"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Version Control :: Git",
+  "Topic :: Utilities",
+]
+dependencies = []  # pure stdlib — no runtime dependencies
+
+[project.scripts]
+saba-cli = "saba_cli.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/saba383810/saba_CLI"
+Source = "https://github.com/saba383810/saba_CLI"
+Issues = "https://github.com/saba383810/saba_CLI/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
