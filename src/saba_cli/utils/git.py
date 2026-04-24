@@ -161,3 +161,36 @@ def list_remotes(cwd: Path | None = None) -> list[str]:
     except GitError:
         return []
     return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def get_user_email(cwd: Path | None = None) -> str:
+    """Return the current git user.email (lowercased), or empty string."""
+    try:
+        return run_git(["config", "user.email"], cwd=cwd).strip().lower()
+    except GitError:
+        return ""
+
+
+@dataclass
+class CommitDetail:
+    full_hash: str
+    body: str                 # full commit message (subject + body)
+    stat_lines: list[str]     # output of `git show --stat --format=`
+
+
+def get_commit_detail(sha: str, cwd: Path | None = None) -> CommitDetail:
+    """Fetch a commit's full message and per-file stat lines.
+
+    Two cheap `git show` calls; callers should cache the result keyed
+    by commit hash since the user may navigate through the same commit
+    many times."""
+    try:
+        body = run_git(["show", "-s", "--format=%B", sha], cwd=cwd).rstrip("\n")
+    except GitError:
+        body = ""
+    try:
+        stat_out = run_git(["show", "--stat", "--format=", sha], cwd=cwd)
+        stat_lines = [line.rstrip() for line in stat_out.splitlines() if line.strip()]
+    except GitError:
+        stat_lines = []
+    return CommitDetail(full_hash=sha, body=body, stat_lines=stat_lines)

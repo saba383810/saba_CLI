@@ -1,20 +1,43 @@
 """Interactive curses TUI for `saba-cli --tree`.
 
-Keys:
-    ↑ / k           move selection up
-    ↓ / j           move selection down
-    PgUp / PgDn     scroll one screen
-    Home / g        jump to newest
-    End  / G        jump to oldest
-    f or /          enter search (incremental filter by hash / author / refs / subject)
-    n / N           next / previous match (when a filter is active)
-    Enter           (in search) commit the filter and resume navigation
-    ESC             in search → cancel; with filter active → clear filter; otherwise → quit
-    q / Q           quit
+Two-pane layout:
 
-The renderer re-defines terminal color slots to the exact Iceberg palette
-when the terminal allows (``can_change_color()``). Falls back to the
-closest xterm-256 color, or finally to 8-color ANSI.
+    ┌─ header (title + repo/branch/commits) ───────────────────┐
+    │  tree pane  — scrollable, column-aligned commit list     │
+    ├─ details ────────────────────────────────────────────────┤
+    │  detail pane — hash / author / date / refs / body / stat │
+    └─ footer (key hints + position / filter indicator) ───────┘
+
+Keys
+----
+    ↑ / k              move selection up
+    ↓ / j              move selection down
+    PgUp / PgDn        scroll one screen
+    Home / g           jump to newest
+    End  / G           jump to oldest
+    [ / ]              scroll the detail pane up / down
+    Tab / d            toggle detail pane
+    m                  toggle "only my commits" filter
+    f or /             enter search (incremental filter by hash/author/refs/subject)
+    Enter              in search → apply filter and resume navigation
+    ESC                in search → cancel; with filter → clear; otherwise → quit
+    q / Q              quit
+
+Design notes
+------------
+* The palette is registered through curses. Where the terminal supports
+  ``can_change_color()`` we redefine 15 slots to the exact Iceberg RGB;
+  otherwise we fall back to the closest xterm-256 color, or 8-color
+  ANSI on very old terminals.
+* Commit details (full message + file-level stats) are fetched lazily
+  with ``git show`` and memoised. The shell-out cost only happens once
+  per commit, so moving up/down is instant after the first visit.
+* The tree row layout is adaptive: when the terminal is narrow we drop
+  lower-priority columns (refs first, then author, then date) so the
+  commit subject always has some room. The detail pane still shows
+  everything for the currently-focused commit.
+* When the terminal is short, the detail pane auto-hides so the tree
+  stays usable — a Tab press re-opens it.
 """
 
 from __future__ import annotations
@@ -32,7 +55,7 @@ from saba_cli.utils import git
 
 
 # ---------------------------------------------------------------------------
-# Iceberg palette + color pair registry
+# Iceberg palette
 # ---------------------------------------------------------------------------
 PAL_HEX = {
     "fg":        "#c6c8d1",
@@ -71,6 +94,9 @@ class CP:
     WARN = 15
     OK = 16
     KEY = 17
+    MINE = 18           # author name highlight for the current user's commits
+    PLUS = 19           # "+" in file stat lines
+    MINUS = 20          # "-" in file stat lines
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -85,7 +111,6 @@ def _hex_to_rgb_1000(hex_color: str) -> tuple[int, int, int]:
 
 def _hex_to_xterm256(hex_color: str) -> int:
     r, g, b = _hex_to_rgb(hex_color)
-    # Grayscale strip
     if abs(r - g) < 16 and abs(g - b) < 16:
         v = (r + g + b) // 3
         if v < 8:
@@ -107,8 +132,6 @@ def _hex_to_xterm256(hex_color: str) -> int:
 
 
 def _setup_palette(use_color: bool) -> None:
-    """Initialise color pairs. When ``use_color`` is False, all pairs map to
-    the terminal default so ``A_REVERSE`` still gives us a visible cursor."""
     if not use_color:
         return
     try:
@@ -174,6 +197,9 @@ def _setup_palette(use_color: bool) -> None:
         CP.WARN:    color_map["yellow_b"],
         CP.OK:      color_map["green_b"],
         CP.KEY:     color_map["cyan_b"],
+        CP.MINE:    color_map["yellow_b"],
+        CP.PLUS:    color_map["green_b"],
+        CP.MINUS:   color_map["red"],
     }
     for pair_id, fg in pairs.items():
         try:
@@ -190,13 +216,30 @@ Segment = tuple[str, int, int]   # (text, color_pair_id, extra_attrs)
 
 @dataclass
 class Row:
-    kind: str                     # "commit" | "graph"
+    kind: str                    # "commit" | "graph"
     selectable: bool
     segments: list[Segment]
     commit: git.Commit | None = None
-    haystack: str = ""            # lowercased search corpus
+    haystack: str = ""
+    is_mine: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Layout helpers
+# ---------------------------------------------------------------------------
+HEADER_H = 3                     # title + info + divider
+FOOTER_H = 2                     # divider + statusline
+MIN_TREE_H = 3
+MIN_DETAIL_H = 6
+MIN_USEFUL_ROWS = 12             # below this, auto-hide detail pane
+NARROW_THRESHOLD_REFS = 90       # drop the refs column below this width
+NARROW_THRESHOLD_AUTHOR = 70     # drop the author column below this width
+NARROW_THRESHOLD_DATE = 54       # drop the relative date below this width
+
+
+# ---------------------------------------------------------------------------
+# Row building (adaptive to terminal width + "mine" marker)
+# ---------------------------------------------------------------------------
 def _ref_segments(refs: list[Ref]) -> list[Segment]:
     segs: list[Segment] = []
     if not refs:
@@ -224,55 +267,94 @@ def _ref_segments(refs: list[Ref]) -> list[Segment]:
     return segs
 
 
+@dataclass(frozen=True)
+class ColumnSpec:
+    show_refs: bool
+    show_date: bool
+    show_author: bool
+
+    @classmethod
+    def for_width(cls, w: int) -> "ColumnSpec":
+        return cls(
+            show_refs=w >= NARROW_THRESHOLD_REFS,
+            show_date=w >= NARROW_THRESHOLD_DATE,
+            show_author=w >= NARROW_THRESHOLD_AUTHOR,
+        )
+
+
 def _build_rows(
     entries: list,
     remotes: list[str],
+    my_email: str,
+    cols: ColumnSpec,
 ) -> list[Row]:
     commits = [e for e in entries if isinstance(e, git.Commit)]
     graph_width = max((len(e.graph) for e in entries), default=0)
     hash_width = max((len(c.short_hash) for c in commits), default=7)
-    date_width = max((len(c.rel_date) for c in commits), default=0)
-    author_width = min(max((len(c.author) for c in commits), default=0), 20)
-    refs_widths = [ref_group_width(parse_refs(c.refs, remotes)) for c in commits]
+    date_width = max((len(c.rel_date) for c in commits), default=0) if cols.show_date else 0
+    author_width = 0
+    if cols.show_author:
+        author_width = min(max((len(c.author) for c in commits), default=0), 20)
+    refs_widths = [ref_group_width(parse_refs(c.refs, remotes)) for c in commits] if cols.show_refs else []
     refs_width = max(refs_widths, default=0)
 
     rows: list[Row] = []
-    commit_iter = iter(zip(commits, refs_widths))
+    commit_iter = iter(zip(commits, refs_widths or [0] * len(commits)))
     for entry in entries:
         if isinstance(entry, git.GraphLine):
             graph_raw = pad_right(entry.graph, graph_width)
             rows.append(Row(
                 kind="graph",
                 selectable=False,
-                segments=[(translate_graph_glyphs(graph_raw), CP.GRAPH, 0)],
+                segments=[
+                    ("  ", CP.DEFAULT, 0),
+                    (translate_graph_glyphs(graph_raw), CP.GRAPH, 0),
+                ],
             ))
             continue
 
         c = entry
-        c_pair, raw_w = next(commit_iter)
+        c_pair, raw_refs_w = next(commit_iter)
+        is_mine = bool(my_email) and c.author_email.lower() == my_email
+
         graph_raw = pad_right(c.graph, graph_width)
         hash_raw = pad_right(c.short_hash, hash_width)
-        refs_pad = " " * (refs_width - raw_w)
-        date_raw = pad_right(c.rel_date, date_width)
-        author_raw = pad_right(truncate(c.author, author_width), author_width)
 
-        segs: list[Segment] = [
-            (translate_graph_glyphs(graph_raw), CP.GRAPH, 0),
-            ("  ", CP.DEFAULT, 0),
-            (hash_raw, CP.HASH, 0),
-            ("  ", CP.DEFAULT, 0),
-        ]
-        segs.extend(_ref_segments(parse_refs(c.refs, remotes)))
-        if refs_pad:
-            segs.append((refs_pad, CP.DEFAULT, 0))
-        segs.extend([
-            ("  ", CP.DEFAULT, 0),
-            (date_raw, CP.DATE, 0),
-            ("  ", CP.DEFAULT, 0),
-            (author_raw, CP.AUTHOR, 0),
-            ("  ", CP.DEFAULT, 0),
-            (c.subject, CP.MESSAGE, 0),
-        ])
+        # Leading "mine" indicator occupies a fixed 2-char column so rows
+        # stay aligned whether the commit is mine or not.
+        segs: list[Segment] = []
+        if is_mine:
+            segs.append(("▎ ", CP.MINE, curses.A_BOLD))
+        else:
+            segs.append(("  ", CP.DEFAULT, 0))
+
+        segs.append((translate_graph_glyphs(graph_raw), CP.GRAPH, 0))
+        segs.append(("  ", CP.DEFAULT, 0))
+        segs.append((hash_raw, CP.HASH, 0))
+
+        if cols.show_refs:
+            segs.append(("  ", CP.DEFAULT, 0))
+            ref_segs = _ref_segments(parse_refs(c.refs, remotes))
+            segs.extend(ref_segs)
+            pad = refs_width - raw_refs_w
+            if pad > 0:
+                segs.append((" " * pad, CP.DEFAULT, 0))
+
+        if cols.show_date:
+            segs.append(("  ", CP.DEFAULT, 0))
+            segs.append((pad_right(c.rel_date, date_width), CP.DATE, 0))
+
+        if cols.show_author:
+            segs.append(("  ", CP.DEFAULT, 0))
+            author_txt = pad_right(truncate(c.author, author_width), author_width)
+            segs.append((
+                author_txt,
+                CP.MINE if is_mine else CP.AUTHOR,
+                curses.A_BOLD if is_mine else 0,
+            ))
+
+        segs.append(("  ", CP.DEFAULT, 0))
+        segs.append((c.subject, CP.MESSAGE, 0))
 
         haystack = " ".join([
             c.short_hash, c.full_hash, c.author, c.author_email, c.refs, c.subject,
@@ -283,33 +365,45 @@ def _build_rows(
             segments=segs,
             commit=c,
             haystack=haystack,
+            is_mine=is_mine,
         ))
     return rows
 
 
 # ---------------------------------------------------------------------------
-# The app
+# App state
 # ---------------------------------------------------------------------------
 @dataclass
 class AppState:
-    all_rows: list[Row]
-    rows: list[Row]
     repo_root: Path
     branch: str
+    my_email: str
     total_commits: int
     shown_commits: int
+
+    entries: list                         # raw git.Commit | git.GraphLine
+    remotes: list[str]
+    all_rows: list[Row]                   # before filters, respects current width
+    rows: list[Row]                       # after search + mine filter
+    col_spec: ColumnSpec
 
     selected: int = 0
     scroll_offset: int = 0
 
-    search_mode: bool = False      # actively typing a query
-    search_query: str = ""          # current query (live filter)
+    search_mode: bool = False
+    search_query: str = ""
+    only_mine: bool = False
+
+    show_details: bool = True
+    detail_scroll: int = 0
+    detail_cache: dict[str, git.CommitDetail] = field(default_factory=dict)
+
     use_color: bool = True
 
-    status: str = ""
-    status_kind: str = "muted"      # one of: muted | ok | warn | err
 
-
+# ---------------------------------------------------------------------------
+# Misc drawing helpers
+# ---------------------------------------------------------------------------
 def _first_selectable(rows: list[Row], start: int = 0) -> int:
     for i in range(start, len(rows)):
         if rows[i].selectable:
@@ -325,14 +419,17 @@ def _segments_width(segs: list[Segment]) -> int:
 
 
 def _draw_segments(
-    stdscr: "curses._CursesWindow",
+    stdscr,
     y: int,
     x: int,
     max_w: int,
     segments: list[Segment],
     base_attr: int = 0,
-) -> None:
+) -> int:
+    """Draw segments starting at (y, x), respecting max_w. Returns the
+    visible width actually written."""
     remaining = max_w
+    written = 0
     for text, pair, attr in segments:
         if remaining <= 0:
             break
@@ -344,54 +441,99 @@ def _draw_segments(
             pass
         x += len(shown)
         remaining -= len(shown)
+        written += len(shown)
+    return written
 
 
+def _stat_segments(line: str) -> list[Segment]:
+    """Color a `git show --stat` line: filename | NNN +++---."""
+    # Summary line: "3 files changed, 20 insertions(+), 4 deletions(-)"
+    if "|" not in line:
+        return [(line, CP.MUTED, 0)]
+    left, _, right = line.partition("|")
+    segs: list[Segment] = [(left, CP.AUTHOR, 0), ("|", CP.MUTED, 0)]
+    for ch in right:
+        if ch == "+":
+            segs.append((ch, CP.PLUS, 0))
+        elif ch == "-":
+            segs.append((ch, CP.MINUS, 0))
+        else:
+            segs.append((ch, CP.MESSAGE, 0))
+    return segs
+
+
+def _wrap_plain(text: str, width: int) -> list[str]:
+    """Soft-wrap a plain string to ``width``. Preserves empty lines."""
+    if width <= 0:
+        return [text]
+    out: list[str] = []
+    for raw in text.splitlines() or [""]:
+        if not raw:
+            out.append("")
+            continue
+        line = raw
+        while len(line) > width:
+            out.append(line[:width])
+            line = line[width:]
+        out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The app
+# ---------------------------------------------------------------------------
 class TreeApp:
-    HEADER_H = 4       # title + blank + info + divider
-    FOOTER_H = 2       # divider + statusline
-
     def __init__(self, stdscr, state: AppState):
         self.stdscr = stdscr
         self.state = state
 
-    # ---- input helpers ---------------------------------------------------
-    def _body_height(self) -> int:
-        h, _ = self.stdscr.getmaxyx()
-        return max(1, h - self.HEADER_H - self.FOOTER_H)
+    # ---- sizing ----------------------------------------------------------
+    def _screen_size(self) -> tuple[int, int]:
+        h, w = self.stdscr.getmaxyx()
+        return h, w
 
-    def _page_size(self) -> int:
-        return max(1, self._body_height() - 1)
+    def _body_region(self) -> tuple[int, int]:
+        """Return (top, height) of the main body area (between header and footer)."""
+        h, _ = self._screen_size()
+        return HEADER_H, max(1, h - HEADER_H - FOOTER_H)
 
-    def _clamp_selected(self) -> None:
+    def _should_show_details(self) -> bool:
+        if not self.state.show_details:
+            return False
+        h, _ = self._screen_size()
+        body = h - HEADER_H - FOOTER_H
+        return body >= MIN_USEFUL_ROWS
+
+    def _pane_split(self) -> tuple[int, int]:
+        """Return (tree_height, detail_height). Detail may be 0 if hidden."""
+        _, body_h = self._body_region()
+        if not self._should_show_details():
+            return body_h, 0
+        # Aim for ~55% tree / ~45% detail, but never less than MIN_DETAIL_H
+        # and never steal the tree's MIN_TREE_H.
+        detail_h = max(MIN_DETAIL_H, (body_h - 1) * 9 // 20)
+        tree_h = body_h - detail_h - 1
+        if tree_h < MIN_TREE_H:
+            tree_h = MIN_TREE_H
+            detail_h = max(1, body_h - tree_h - 1)
+        return tree_h, detail_h
+
+    # ---- selection / scroll ---------------------------------------------
+    def _current_commit(self) -> git.Commit | None:
         rows = self.state.rows
         if not rows:
-            self.state.selected = 0
-            self.state.scroll_offset = 0
-            return
-        self.state.selected = max(0, min(self.state.selected, len(rows) - 1))
-        # If landed on a non-selectable (graph) line, hop to the nearest selectable.
-        if not rows[self.state.selected].selectable:
-            # search forward first, then backward
-            fwd = next(
-                (i for i in range(self.state.selected + 1, len(rows)) if rows[i].selectable),
-                None,
-            )
-            bwd = next(
-                (i for i in range(self.state.selected - 1, -1, -1) if rows[i].selectable),
-                None,
-            )
-            if fwd is not None:
-                self.state.selected = fwd
-            elif bwd is not None:
-                self.state.selected = bwd
+            return None
+        row = rows[min(self.state.selected, len(rows) - 1)]
+        return row.commit if row.selectable else None
 
-    def _ensure_visible(self) -> None:
-        body = self._body_height()
+    def _ensure_visible(self, tree_h: int) -> None:
+        if tree_h <= 0 or not self.state.rows:
+            return
         if self.state.selected < self.state.scroll_offset:
             self.state.scroll_offset = self.state.selected
-        elif self.state.selected >= self.state.scroll_offset + body:
-            self.state.scroll_offset = self.state.selected - body + 1
-        max_offset = max(0, len(self.state.rows) - body)
+        elif self.state.selected >= self.state.scroll_offset + tree_h:
+            self.state.scroll_offset = self.state.selected - tree_h + 1
+        max_offset = max(0, len(self.state.rows) - tree_h)
         self.state.scroll_offset = max(0, min(self.state.scroll_offset, max_offset))
 
     def _move(self, delta: int) -> None:
@@ -401,14 +543,12 @@ class TreeApp:
         step = 1 if delta > 0 else -1
         target = self.state.selected + delta
         target = max(0, min(target, len(rows) - 1))
-        # Snap to nearest selectable in the direction of motion.
         while 0 <= target < len(rows) and not rows[target].selectable:
             target += step
         if target < 0 or target >= len(rows):
-            # fall back to any selectable
             target = _first_selectable(rows, max(0, self.state.selected))
         self.state.selected = target
-        self._ensure_visible()
+        self.state.detail_scroll = 0
 
     def _jump(self, where: str) -> None:
         rows = self.state.rows
@@ -416,32 +556,139 @@ class TreeApp:
             return
         if where == "top":
             self.state.selected = _first_selectable(rows, 0)
-        else:  # "bottom"
+        else:
             for i in range(len(rows) - 1, -1, -1):
                 if rows[i].selectable:
                     self.state.selected = i
                     break
-        self._ensure_visible()
+        self.state.detail_scroll = 0
 
     # ---- filtering -------------------------------------------------------
-    def _apply_filter(self) -> None:
-        q = self.state.search_query.strip().lower()
-        if not q:
-            self.state.rows = list(self.state.all_rows)
-        else:
-            self.state.rows = [
-                r for r in self.state.all_rows
-                if r.selectable and q in r.haystack
-            ]
+    def _apply_filters(self) -> None:
+        query = self.state.search_query.strip().lower()
+        only_mine = self.state.only_mine
+        filtered: list[Row] = []
+        for r in self.state.all_rows:
+            if not r.selectable and (query or only_mine):
+                # Skip graph connectors when any filter is active — the
+                # tree structure would be misleading anyway.
+                continue
+            if only_mine and not r.is_mine:
+                continue
+            if query and query not in r.haystack:
+                continue
+            filtered.append(r)
+        self.state.rows = filtered
         self.state.selected = _first_selectable(self.state.rows, 0) if self.state.rows else 0
         self.state.scroll_offset = 0
+        self.state.detail_scroll = 0
+
+    # ---- width changes ---------------------------------------------------
+    def _rebuild_rows_for_width(self) -> None:
+        _, w = self._screen_size()
+        spec = ColumnSpec.for_width(w)
+        if spec == self.state.col_spec:
+            return
+        self.state.col_spec = spec
+        # Preserve currently-selected commit across the rebuild.
+        selected_hash = None
+        if 0 <= self.state.selected < len(self.state.rows):
+            r = self.state.rows[self.state.selected]
+            if r.commit is not None:
+                selected_hash = r.commit.full_hash
+        self.state.all_rows = _build_rows(
+            self.state.entries, self.state.remotes, self.state.my_email, spec,
+        )
+        self._apply_filters()
+        if selected_hash:
+            for i, r in enumerate(self.state.rows):
+                if r.commit and r.commit.full_hash == selected_hash:
+                    self.state.selected = i
+                    break
+
+    # ---- detail pane -----------------------------------------------------
+    def _get_detail(self, full_hash: str) -> git.CommitDetail:
+        cache = self.state.detail_cache
+        if full_hash not in cache:
+            cache[full_hash] = git.get_commit_detail(full_hash, cwd=self.state.repo_root)
+        return cache[full_hash]
+
+    def _detail_lines(self, w: int) -> list[list[Segment]]:
+        c = self._current_commit()
+        if c is None:
+            return [[("(no commit selected)", CP.MUTED, 0)]]
+        detail = self._get_detail(c.full_hash)
+        inner_w = max(20, w - 4)
+        lines: list[list[Segment]] = []
+
+        lines.append([
+            ("commit ", CP.KEY, 0),
+            (c.full_hash, CP.HASH, 0),
+        ])
+        mine_suffix: list[Segment] = []
+        if self.state.my_email and c.author_email.lower() == self.state.my_email:
+            mine_suffix = [("  ", CP.DEFAULT, 0), ("(you)", CP.MINE, curses.A_BOLD)]
+        lines.append([
+            ("author ", CP.KEY, 0),
+            (c.author, CP.AUTHOR, 0),
+            (f"  <{c.author_email}>", CP.MUTED, 0),
+            *mine_suffix,
+        ])
+        lines.append([
+            ("date   ", CP.KEY, 0),
+            (c.iso_date, CP.MESSAGE, 0),
+            (f"  ({c.rel_date})", CP.DATE, 0),
+        ])
+        refs = parse_refs(c.refs, self.state.remotes)
+        if refs:
+            segs: list[Segment] = [("refs   ", CP.KEY, 0)]
+            segs.extend(_ref_segments(refs))
+            lines.append(segs)
+
+        lines.append([])  # blank separator
+
+        body = detail.body or c.subject
+        for raw in _wrap_plain(body, inner_w - 2):
+            lines.append([("  " + raw, CP.MESSAGE, 0)])
+
+        if detail.stat_lines:
+            lines.append([])
+            # Keep the summary line if present (usually last)
+            shown = detail.stat_lines[:20]
+            for stat in shown:
+                lines.append(_stat_segments(stat))
+            if len(detail.stat_lines) > len(shown):
+                lines.append([
+                    (f"  … {len(detail.stat_lines) - len(shown)} more files omitted",
+                     CP.MUTED, 0),
+                ])
+        return lines
 
     # ---- drawing ---------------------------------------------------------
     def _draw(self) -> None:
+        self._rebuild_rows_for_width()
         self.stdscr.erase()
-        h, w = self.stdscr.getmaxyx()
+        h, w = self._screen_size()
+
+        if w < 30 or h < 8:
+            try:
+                self.stdscr.addnstr(0, 0, "terminal too small", w,
+                                    curses.color_pair(CP.WARN))
+            except curses.error:
+                pass
+            self.stdscr.refresh()
+            return
+
         self._draw_header(w)
-        self._draw_body(h, w)
+        tree_h, detail_h = self._pane_split()
+        tree_top = HEADER_H
+        self._ensure_visible(tree_h)
+        self._draw_tree(tree_top, tree_h, w)
+
+        if detail_h > 0:
+            self._draw_detail_divider(tree_top + tree_h, w)
+            self._draw_detail(tree_top + tree_h + 1, detail_h, w)
+
         self._draw_footer(h, w)
         self.stdscr.refresh()
 
@@ -451,40 +698,46 @@ class TreeApp:
             ("  ·  ", CP.MUTED, 0),
             ("git tree", CP.ACCENT, 0),
         ]
+        if self.state.only_mine:
+            title_segs.extend([
+                ("  ·  ", CP.MUTED, 0),
+                ("mine only", CP.MINE, curses.A_BOLD),
+            ])
         _draw_segments(self.stdscr, 0, 2, w - 2, title_segs)
 
         st = self.state
         info_segs: list[Segment] = [
-            ("Repo ",    CP.KEY,     0), (str(st.repo_root), CP.MESSAGE, 0),
+            ("repo ",    CP.KEY,     0), (str(st.repo_root), CP.MESSAGE, 0),
             ("   ·   ",  CP.MUTED,   0),
-            ("Branch ",  CP.KEY,     0), (st.branch,         CP.MESSAGE, 0),
+            ("branch ",  CP.KEY,     0), (st.branch,         CP.MESSAGE, 0),
             ("   ·   ",  CP.MUTED,   0),
-            ("Commits ", CP.KEY,     0), (str(st.total_commits), CP.MESSAGE, 0),
+            ("commits ", CP.KEY,     0), (str(st.total_commits), CP.MESSAGE, 0),
         ]
         if st.shown_commits < st.total_commits:
             info_segs.append(
-                (f"   (showing latest {st.shown_commits})", CP.MUTED, 0)
+                (f"  (latest {st.shown_commits})", CP.MUTED, 0)
             )
-        _draw_segments(self.stdscr, 2, 2, w - 2, info_segs)
+        _draw_segments(self.stdscr, 1, 2, w - 2, info_segs)
 
         try:
-            self.stdscr.addnstr(3, 0, "─" * w, w, curses.color_pair(CP.MUTED))
+            self.stdscr.addnstr(2, 0, "─" * w, w, curses.color_pair(CP.MUTED))
         except curses.error:
             pass
 
-    def _draw_body(self, h: int, w: int) -> None:
-        body_h = self._body_height()
-        top = self.HEADER_H
+    def _draw_tree(self, top: int, height: int, w: int) -> None:
         rows = self.state.rows
-
         if not rows:
-            msg_segs: list[Segment] = [
-                ("(no matches)", CP.WARN, 0),
-            ]
-            _draw_segments(self.stdscr, top + 1, 4, w - 4, msg_segs)
+            msg = ("(no matches — press esc to clear filter)" if
+                   (self.state.search_query or self.state.only_mine)
+                   else "(no commits)")
+            try:
+                self.stdscr.addnstr(top + 1, 2, msg, w - 2,
+                                    curses.color_pair(CP.WARN))
+            except curses.error:
+                pass
             return
 
-        for i in range(body_h):
+        for i in range(height):
             idx = self.state.scroll_offset + i
             if idx >= len(rows):
                 break
@@ -497,7 +750,45 @@ class TreeApp:
                 except curses.error:
                     pass
             base = curses.A_REVERSE if selected else 0
-            _draw_segments(self.stdscr, y, 2, w - 3, row.segments, base_attr=base)
+            _draw_segments(self.stdscr, y, 0, w, row.segments, base_attr=base)
+
+    def _draw_detail_divider(self, y: int, w: int) -> None:
+        # Divider with a small label in the middle.
+        label = " details "
+        bar = "─"
+        try:
+            self.stdscr.addnstr(y, 0, bar * w, w, curses.color_pair(CP.MUTED))
+        except curses.error:
+            pass
+        label_x = 2
+        try:
+            self.stdscr.addnstr(y, label_x, label, w - label_x,
+                                curses.color_pair(CP.ACCENT) | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def _draw_detail(self, top: int, height: int, w: int) -> None:
+        lines = self._detail_lines(w)
+        self.state.detail_scroll = max(
+            0, min(self.state.detail_scroll, max(0, len(lines) - height))
+        )
+        for i in range(height):
+            idx = self.state.detail_scroll + i
+            if idx >= len(lines):
+                break
+            segs = lines[idx]
+            if not segs:
+                continue
+            _draw_segments(self.stdscr, top + i, 2, w - 3, segs)
+
+        # Scroll hint if content was clipped
+        if len(lines) > height:
+            hint = f" {self.state.detail_scroll + 1}–{min(len(lines), self.state.detail_scroll + height)}/{len(lines)} "
+            try:
+                self.stdscr.addnstr(top, max(0, w - len(hint) - 1), hint,
+                                    len(hint), curses.color_pair(CP.MUTED))
+            except curses.error:
+                pass
 
     def _draw_footer(self, h: int, w: int) -> None:
         divider_y = h - 2
@@ -513,7 +804,7 @@ class TreeApp:
             segs: list[Segment] = [
                 (prompt, CP.ACCENT, curses.A_BOLD),
                 (st.search_query, CP.MESSAGE, 0),
-                ("▏", CP.ACCENT, curses.A_BOLD),   # fake block cursor
+                ("▏", CP.ACCENT, curses.A_BOLD),
             ]
             right = "enter: apply   esc: cancel"
             _draw_segments(self.stdscr, bar_y, 2, w - 2, segs)
@@ -523,33 +814,49 @@ class TreeApp:
                                [(right, CP.MUTED, 0)])
             return
 
-        # Nav footer
-        if st.search_query:
+        # Compact / wide footer depending on available columns.
+        compact = w < 80
+        left_segs: list[Segment] = []
+        if st.search_query or st.only_mine:
+            bits: list[str] = []
+            if st.only_mine:
+                bits.append("mine")
+            if st.search_query:
+                bits.append(f'"{st.search_query}"')
             hits = sum(1 for r in st.rows if r.selectable)
-            left_segs: list[Segment] = [
+            left_segs = [
                 ("filter ", CP.WARN, curses.A_BOLD),
-                (f"\"{st.search_query}\"", CP.MESSAGE, 0),
+                (" · ".join(bits), CP.MESSAGE, 0),
                 (f"  ·  {hits} hit" + ("" if hits == 1 else "s"), CP.MUTED, 0),
             ]
         else:
-            left_segs = [
-                ("↑↓ ", CP.ACCENT, curses.A_BOLD), ("move  ", CP.MUTED, 0),
-                ("f ",  CP.ACCENT, curses.A_BOLD), ("search  ", CP.MUTED, 0),
-                ("g/G ",CP.ACCENT, curses.A_BOLD), ("top/bot  ", CP.MUTED, 0),
-                ("esc/q ", CP.ACCENT, curses.A_BOLD), ("quit", CP.MUTED, 0),
-            ]
+            if compact:
+                left_segs = [
+                    ("↑↓ ", CP.ACCENT, curses.A_BOLD), ("nav  ", CP.MUTED, 0),
+                    ("f ",  CP.ACCENT, curses.A_BOLD), ("find  ", CP.MUTED, 0),
+                    ("m ",  CP.ACCENT, curses.A_BOLD), ("mine  ", CP.MUTED, 0),
+                    ("tab ",CP.ACCENT, curses.A_BOLD), ("detail  ", CP.MUTED, 0),
+                    ("q ",  CP.ACCENT, curses.A_BOLD), ("quit", CP.MUTED, 0),
+                ]
+            else:
+                left_segs = [
+                    ("↑↓ ",  CP.ACCENT, curses.A_BOLD), ("move  ", CP.MUTED, 0),
+                    ("f ",   CP.ACCENT, curses.A_BOLD), ("search  ", CP.MUTED, 0),
+                    ("m ",   CP.ACCENT, curses.A_BOLD), ("mine  ", CP.MUTED, 0),
+                    ("tab ", CP.ACCENT, curses.A_BOLD), ("detail  ", CP.MUTED, 0),
+                    ("[ ] ", CP.ACCENT, curses.A_BOLD), ("scroll  ", CP.MUTED, 0),
+                    ("g/G ", CP.ACCENT, curses.A_BOLD), ("top/bot  ", CP.MUTED, 0),
+                    ("esc/q ", CP.ACCENT, curses.A_BOLD), ("quit", CP.MUTED, 0),
+                ]
         _draw_segments(self.stdscr, bar_y, 2, w - 2, left_segs)
 
-        # Position indicator on the right
         selectable_rows = [r for r in st.rows if r.selectable]
         if selectable_rows:
-            # Which selectable index is currently highlighted?
-            sel_idx = 0
-            for i, r in enumerate(st.rows):
-                if i == st.selected and r.selectable:
-                    sel_idx = sum(1 for rr in st.rows[: i + 1] if rr.selectable)
-                    break
-            right = f"{sel_idx}/{len(selectable_rows)}"
+            sel_pos = 0
+            for i in range(min(st.selected, len(st.rows) - 1) + 1):
+                if st.rows[i].selectable:
+                    sel_pos += 1
+            right = f"{sel_pos}/{len(selectable_rows)}"
             right_x = w - len(right) - 2
             if right_x > _segments_width(left_segs) + 4:
                 _draw_segments(self.stdscr, bar_y, right_x, len(right) + 1,
@@ -578,12 +885,12 @@ class TreeApp:
     def _handle_nav_key(self, key) -> bool:
         st = self.state
         if key == curses.KEY_RESIZE:
-            self._ensure_visible()
             return False
         if isinstance(key, str) and key == "\x1b":   # ESC
-            if st.search_query:
+            if st.search_query or st.only_mine:
                 st.search_query = ""
-                self._apply_filter()
+                st.only_mine = False
+                self._apply_filters()
                 return False
             return True
         if isinstance(key, str) and key in ("q", "Q"):
@@ -593,9 +900,11 @@ class TreeApp:
         elif key == curses.KEY_DOWN or key == "j":
             self._move(1)
         elif key == curses.KEY_PPAGE:
-            self._move(-self._page_size())
+            tree_h, _ = self._pane_split()
+            self._move(-max(1, tree_h - 1))
         elif key == curses.KEY_NPAGE:
-            self._move(self._page_size())
+            tree_h, _ = self._pane_split()
+            self._move(max(1, tree_h - 1))
         elif key == curses.KEY_HOME or key == "g":
             self._jump("top")
         elif key == curses.KEY_END or key == "G":
@@ -603,29 +912,38 @@ class TreeApp:
         elif isinstance(key, str) and key in ("f", "F", "/"):
             st.search_mode = True
             st.search_query = ""
-            curses.curs_set(0)  # we draw our own cursor
-            self._apply_filter()
+            self._apply_filters()
+        elif isinstance(key, str) and key in ("m", "M"):
+            st.only_mine = not st.only_mine
+            self._apply_filters()
+        elif key == "\t" or (isinstance(key, str) and key in ("d", "D")):
+            st.show_details = not st.show_details
+            st.detail_scroll = 0
+        elif isinstance(key, str) and key == "[":
+            st.detail_scroll = max(0, st.detail_scroll - 1)
+        elif isinstance(key, str) and key == "]":
+            st.detail_scroll += 1   # clamped during draw
         return False
 
     def _handle_search_key(self, key) -> bool:
         st = self.state
         if key == curses.KEY_RESIZE:
             return False
-        if isinstance(key, str) and key == "\x1b":       # ESC → cancel
+        if isinstance(key, str) and key == "\x1b":
             st.search_mode = False
             st.search_query = ""
-            self._apply_filter()
+            self._apply_filters()
             return False
         if key in (curses.KEY_ENTER,) or (isinstance(key, str) and key in ("\n", "\r")):
             st.search_mode = False
             return False
         if key == curses.KEY_BACKSPACE or (isinstance(key, str) and key in ("\x7f", "\x08")):
             st.search_query = st.search_query[:-1]
-            self._apply_filter()
+            self._apply_filters()
             return False
         if isinstance(key, str) and key.isprintable():
             st.search_query += key
-            self._apply_filter()
+            self._apply_filters()
         return False
 
 
@@ -633,7 +951,6 @@ class TreeApp:
 # Entry point
 # ---------------------------------------------------------------------------
 def run_tui(args) -> int:
-    # Make ESC feel snappy — default is 1s which is miserable for our UX.
     os.environ.setdefault("ESCDELAY", "25")
 
     from saba_cli import theme
@@ -673,20 +990,42 @@ def run_tui(args) -> int:
         return 1
 
     remotes = git.list_remotes(cwd=repo_root)
-    rows = _build_rows(entries, remotes)
+    my_email = git.get_user_email(cwd=repo_root)
     branch = git.get_current_branch(cwd=repo_root)
+
+    # Start with a wide assumption — the real ColumnSpec is recomputed
+    # from the actual curses window size on the first draw.
+    initial_spec = ColumnSpec.for_width(120)
+    rows = _build_rows(entries, remotes, my_email, initial_spec)
     shown = sum(1 for r in rows if r.selectable)
 
     state = AppState(
-        all_rows=rows,
-        rows=list(rows),
         repo_root=repo_root,
         branch=branch,
+        my_email=my_email,
         total_commits=total,
         shown_commits=shown,
+        entries=entries,
+        remotes=remotes,
+        all_rows=rows,
+        rows=list(rows),
+        col_spec=initial_spec,
         use_color=not args.no_color,
     )
     state.selected = _first_selectable(state.rows, 0)
+
+    # Start with detail pane off if the user explicitly asked or the
+    # terminal looks shorter than ``MIN_USEFUL_ROWS`` — the TreeApp will
+    # also auto-hide if space is tight at draw time.
+    if getattr(args, "no_details", False):
+        state.show_details = False
+    if getattr(args, "mine", False):
+        state.only_mine = True
+        # re-filter once the state is complete
+        q = ""
+        state.search_query = q
+        state.rows = [r for r in state.all_rows if r.selectable and r.is_mine]
+        state.selected = _first_selectable(state.rows, 0) if state.rows else 0
 
     def _main(stdscr):
         _setup_palette(state.use_color)

@@ -16,6 +16,8 @@ complete -c saba-cli       -l no-all         -d "Restrict to the current branch 
 complete -c saba-cli       -l no-color       -d "Disable colored output (implies --static)"
 complete -c saba-cli       -l static         -d "Print the static tree instead of the TUI"
 complete -c saba-cli -s i -l interactive     -d "Force the interactive TUI even when not a TTY"
+complete -c saba-cli       -l no-details     -d "Start with the TUI detail pane hidden"
+complete -c saba-cli -s m -l mine            -d "Start with the 'only my commits' filter active"
 
 # Meta
 complete -c saba-cli -s h -l help    -d "Show help"

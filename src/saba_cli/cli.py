@@ -74,6 +74,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Force the interactive TUI even when stdout is not a TTY.",
     )
     parser.add_argument(
+        "--no-details",
+        action="store_true",
+        help="Start with the TUI detail pane hidden (toggle later with Tab).",
+    )
+    parser.add_argument(
+        "-m", "--mine",
+        action="store_true",
+        help="Start with the 'only my commits' filter active "
+             "(matches the current git user.email).",
+    )
+    parser.add_argument(
         "-V", "--version",
         action="version",
         version=f"saba-cli {__version__}",

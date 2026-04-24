@@ -79,6 +79,8 @@ ln -s "$PWD/bin/saba-cli" /usr/local/bin/saba-cli
 
 ```bash
 saba-cli --tree                 # interactive TUI (static when piped)
+saba-cli --tree --mine          # start with the 'only my commits' filter
+saba-cli --tree --no-details    # start with the detail pane hidden
 saba-cli --tree --static        # skip the TUI, print once and exit
 saba-cli --tree --limit 20      # most recent 20 commits only
 saba-cli --tree --no-all        # just the current branch
@@ -87,23 +89,53 @@ saba-cli --help
 saba-cli --version
 ```
 
+### Interactive layout
+
+Two panes are visible when the terminal has room (auto-hidden when it
+does not):
+
+- **tree** (top) — the scrollable commit graph
+- **detail** (bottom) — full hash, author + email, absolute & relative
+  date, every ref, the full commit message, and `git show --stat`
+  output with `+`/`-` colored
+
+Commits by the current git user (`git config user.email`) get a `▎`
+marker at the left edge and a bold amber author name, so it is easy to
+spot your own work in a crowded tree. The filter `m` narrows the tree
+to just those commits.
+
 ### Interactive key bindings (TUI)
 
-| keys                    | action                                         |
-|-------------------------|------------------------------------------------|
-| `↑` / `k`               | move selection up                              |
-| `↓` / `j`               | move selection down                            |
-| `PgUp` / `PgDn`         | scroll one screen                              |
-| `Home` / `g`            | jump to newest                                 |
-| `End`  / `G`            | jump to oldest                                 |
-| `f` or `/`              | enter search mode (incremental filter)         |
-| `Enter`                 | in search: apply filter and resume navigation  |
-| `Esc`                   | in search: cancel; with filter: clear; else quit |
-| `q` / `Q`               | quit                                           |
+| keys                    | action                                                    |
+|-------------------------|-----------------------------------------------------------|
+| `↑` / `k`               | move selection up                                         |
+| `↓` / `j`               | move selection down                                       |
+| `PgUp` / `PgDn`         | scroll one screen                                         |
+| `Home` / `g`            | jump to newest                                            |
+| `End`  / `G`            | jump to oldest                                            |
+| `Tab` / `d`             | toggle the detail pane                                    |
+| `[` / `]`               | scroll the detail pane up / down                          |
+| `m`                     | toggle "only my commits" filter                           |
+| `f` or `/`              | enter search mode (incremental filter)                    |
+| `Enter`                 | in search: apply filter and resume navigation             |
+| `Esc`                   | in search: cancel; with filter: clear; else quit          |
+| `q` / `Q`               | quit                                                      |
 
-Search matches across the commit hash, author, refs, and subject.
-Graph connector lines (`|/`, `|\`, …) stay in place but the cursor
-skips over them automatically.
+Search matches across commit hash, author, refs, and subject.
+Graph connector lines stay in place but the cursor skips over them.
+
+### Adaptive layout for narrow terminals
+
+When the pane you run `saba-cli` in is narrow, lower-priority columns
+are dropped automatically so the subject always has room:
+
+- width `≥ 90`: graph · mine · hash · refs · date · author · subject
+- width `≥ 70`: graph · mine · hash · date · author · subject
+- width `≥ 54`: graph · mine · hash · date · subject
+- width `<  54`: graph · mine · hash · subject
+
+The detail pane still shows the full information for the selected
+commit regardless.
 
 ### What the tree shows
 
