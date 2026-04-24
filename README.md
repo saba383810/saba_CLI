@@ -5,19 +5,22 @@
 `saba-cli` is a small, extensible command-line tool. The first feature is
 `saba-cli --tree`: a clean, information-dense rendering of the git commit
 graph that uses the [Iceberg](https://cocopon.github.io/iceberg.vim/) color
-palette.
+palette — with an **interactive TUI** when run in a terminal.
 
 ## Highlights
 
+- **Interactive by default.** In a real TTY, `saba-cli --tree` opens an
+  interactive curses viewer: arrow-key navigation, incremental search,
+  `esc` to quit. Falls back to a static ANSI render when piped or
+  redirected (or when `--static` is passed).
 - **Zero runtime dependencies.** Pure Python 3.9+ stdlib. No pip install
   step required to try it — just run the launcher in `bin/`.
-- **Iceberg-themed.** 24-bit ANSI colors that match the Iceberg palette
-  exactly. Colors auto-disable when the output is not a TTY or when
-  `NO_COLOR` / `--no-color` is set.
+- **Iceberg-themed.** 24-bit colors matching the Iceberg palette
+  exactly; auto-fallback to xterm-256 and then to 8-color on older
+  terminals.
 - **All the info you want in one line.** For each commit: graph node,
   short hash, refs (HEAD, local branch, remote branch, tags), relative
-  date, author, and subject — column-aligned and trimmed to fit your
-  terminal width.
+  date, author, and subject — column-aligned and trimmed to fit.
 - **Extensible.** New commands drop into `src/saba_cli/commands/` and
   register in `cli.py`.
 
@@ -75,13 +78,32 @@ ln -s "$PWD/bin/saba-cli" /usr/local/bin/saba-cli
 ## Usage
 
 ```bash
-saba-cli --tree                 # pretty git tree of the current repo
+saba-cli --tree                 # interactive TUI (static when piped)
+saba-cli --tree --static        # skip the TUI, print once and exit
 saba-cli --tree --limit 20      # most recent 20 commits only
 saba-cli --tree --no-all        # just the current branch
-saba-cli --tree --no-color      # plain text, no ANSI
+saba-cli --tree --no-color      # plain text, implies --static
 saba-cli --help
 saba-cli --version
 ```
+
+### Interactive key bindings (TUI)
+
+| keys                    | action                                         |
+|-------------------------|------------------------------------------------|
+| `↑` / `k`               | move selection up                              |
+| `↓` / `j`               | move selection down                            |
+| `PgUp` / `PgDn`         | scroll one screen                              |
+| `Home` / `g`            | jump to newest                                 |
+| `End`  / `G`            | jump to oldest                                 |
+| `f` or `/`              | enter search mode (incremental filter)         |
+| `Enter`                 | in search: apply filter and resume navigation  |
+| `Esc`                   | in search: cancel; with filter: clear; else quit |
+| `q` / `Q`               | quit                                           |
+
+Search matches across the commit hash, author, refs, and subject.
+Graph connector lines (`|/`, `|\`, …) stay in place but the cursor
+skips over them automatically.
 
 ### What the tree shows
 
@@ -119,7 +141,10 @@ saba_cli/
 │       ├── cli.py            # argparse dispatcher
 │       ├── theme.py          # Iceberg palette + ANSI helpers
 │       ├── commands/
-│       │   └── tree.py       # --tree implementation
+│       │   ├── tree.py           # --tree dispatcher (static / TUI)
+│       │   ├── _tree_common.py   # shared helpers (ref parse, graph glyphs, pad/trunc)
+│       │   ├── _tree_static.py   # static ANSI renderer
+│       │   └── _tree_tui.py      # interactive curses viewer
 │       └── utils/
 │           └── git.py        # git subprocess wrapper
 ├── pyproject.toml

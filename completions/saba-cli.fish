@@ -10,10 +10,12 @@ complete -c saba-cli -f
 complete -c saba-cli -l tree        -d "Render the git commit tree (Iceberg-themed)"
 
 # Shared options
-complete -c saba-cli -s n -l limit  -x -d "Limit number of commits shown (int, default 100)"
-complete -c saba-cli       -l all      -d "Include all branches in the tree (default)"
-complete -c saba-cli       -l no-all   -d "Restrict to the current branch only"
-complete -c saba-cli       -l no-color -d "Disable colored output"
+complete -c saba-cli -s n -l limit       -x -d "Limit number of commits shown (int, default 100)"
+complete -c saba-cli       -l all            -d "Include all branches in the tree (default)"
+complete -c saba-cli       -l no-all         -d "Restrict to the current branch only"
+complete -c saba-cli       -l no-color       -d "Disable colored output (implies --static)"
+complete -c saba-cli       -l static         -d "Print the static tree instead of the TUI"
+complete -c saba-cli -s i -l interactive     -d "Force the interactive TUI even when not a TTY"
 
 # Meta
 complete -c saba-cli -s h -l help    -d "Show help"

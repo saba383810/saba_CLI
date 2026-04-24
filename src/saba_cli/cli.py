@@ -59,7 +59,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-color",
         action="store_true",
-        help="Disable colored output (NO_COLOR env var is also honored).",
+        help="Disable colored output (NO_COLOR env var is also honored). "
+             "Implies --static.",
+    )
+    parser.add_argument(
+        "--static",
+        action="store_true",
+        help="Print the tree statically instead of launching the interactive TUI. "
+             "This is also the default when stdout is not a TTY.",
+    )
+    parser.add_argument(
+        "-i", "--interactive",
+        action="store_true",
+        help="Force the interactive TUI even when stdout is not a TTY.",
     )
     parser.add_argument(
         "-V", "--version",
