@@ -1,0 +1,1450 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>saba-cli panel</title>
+<!--
+  saba-cli panel — iTerm2 Toolbelt 用 WebView。
+  sessions = 今動いている AI agent のセッション（ペイン単位・自動検出・登録不要）
+  profiles = 保存したタブを開くショートカット（押すたびに新しいタブ。agent とは無関係）
+  file:// で開くか ?mock を付けるとモックデータで動く（本番は daemon が ?t=<token> 付きで配信）。
+  モック用: ?demo=fault|hist|menu|help|group|collapsed|move|save|startup|sgroup|gdirs|smenu|multi、Shift+E で iTerm2 エラー表示を切替。
+-->
+<style>
+:root{
+  --bg:#161821;--bg-alt:#1e2132;--bg-sel:#262a3f;--line:#2a2f45;--line-hi:#444b71;
+  --fg:#c6c8d1;--fg-dim:#6b7089;--fg-faint:#444b71;--fg-hi:#e1e3ea;
+  --red:#e27878;--green:#b4be82;--yellow:#e2a478;--blue:#84a0c6;--magenta:#a093c7;--cyan:#89b8c2;
+  --font:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Monaco,"Hiragino Kaku Gothic ProN",monospace;
+}
+@media (prefers-color-scheme:light){:root{
+  --bg:#e8e9ec;--bg-alt:#dcdee6;--bg-sel:#cdd1dd;--line:#c4c7d4;--line-hi:#9aa0bb;
+  --fg:#33374c;--fg-dim:#8389a3;--fg-faint:#b0b4c6;--fg-hi:#1f2233;
+  --red:#cc517a;--green:#668e3d;--yellow:#c57339;--blue:#2d539e;--magenta:#7759b4;--cyan:#3f83a6;}}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font:12px/1.6 var(--font);display:flex;flex-direction:column;
+  overflow:hidden;user-select:none;-webkit-user-select:none;cursor:default;-webkit-font-smoothing:antialiased}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0;text-align:left}
+input{font:inherit;color:var(--fg-hi);background:none;border:0;outline:0;caret-color:var(--cyan);min-width:0}
+input::placeholder{color:var(--fg-faint)}
+kbd{font:inherit}
+[hidden]{display:none!important}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:var(--line)}
+.dim{color:var(--fg-dim)}.faint{color:var(--fg-faint)}
+.fill{flex:1 1 auto;min-width:1ch}
+
+/* header */
+header{flex:none;padding:6px 1.5ch 0}
+.hl{display:flex;align-items:baseline;gap:1ch}
+.brand{color:var(--cyan);font-weight:700}
+.conn i{font-style:normal;color:var(--green)}.conn{color:var(--fg-dim)}
+.conn.bad i{color:var(--red)}.conn.mock i{color:var(--fg-faint)}
+.ctrs{display:flex;flex-wrap:wrap;column-gap:2ch}
+.ctr{display:inline-flex;gap:.6ch;color:var(--fg-dim)}
+.ctr b{font-weight:400;color:var(--fg-hi)}
+.ctr.zero,.ctr.zero b,.ctr.zero .g{color:var(--fg-faint)!important;cursor:default}
+.ctr:not(.zero):hover span:last-child{color:var(--fg-hi)}
+.k-run .g{color:var(--blue)}.k-ask .g{color:var(--red)}.k-done .g{color:var(--yellow)}.k-idle .g{color:var(--fg-dim)}
+
+/* titled box (lazygit 風) */
+.box{position:relative;border:1px solid var(--line);margin:14px 6px 0;padding:7px 0 4px;display:flex;flex-direction:column;min-height:0}
+.box-t{position:absolute;top:-.82em;left:1ch;right:1ch;display:flex;align-items:center;gap:.5ch;pointer-events:none;line-height:1.5}
+.box-t>*{background:var(--bg);padding:0 .5ch;pointer-events:auto;white-space:nowrap}
+.box-t>.fill{background:none;pointer-events:none}
+.box-t .t{color:var(--fg-hi)}
+.box-t .n{color:var(--fg-faint)}
+.tb{color:var(--fg-dim)}.tb:hover{color:var(--fg-hi)}
+.box-b{overflow-y:auto;min-height:0}
+.box.collapsed{padding:5px 0 0;min-height:0!important;flex:none!important}
+.box.collapsed>.box-b,.box.collapsed .when-open{display:none}
+/* 高さの優先: sessions（今の状態）は縮めない → profiles → history の順に譲る */
+#sess{flex:0 0 auto;max-height:58vh}
+#prof{flex:0 1 auto;min-height:6.5em}
+#hist{flex:1 1 0;min-height:4.8em}
+body:has(#gform:not([hidden])) #sess,body:has(#sform:not([hidden])) #sess{max-height:34vh}   /* フォームを開いている間は profiles 欄に場所を譲る */
+#fault{border-color:var(--red);flex:none}
+#fault .box-t .t{color:var(--red)}
+#fault .box-b{padding:0 1ch;color:var(--fg-dim)}
+#fault .m{color:var(--fg)}
+#fault .d{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* rows (sessions / profiles 共通) */
+.row{position:relative;padding:3px 1ch 3px 0;cursor:pointer}
+.row.sel{background:var(--bg-alt)}
+.row.active::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--cyan)}
+.l1{display:flex;align-items:baseline;white-space:nowrap}
+.g{width:3ch;flex:none;text-align:center}
+.name{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.row.active .name{color:var(--fg-hi);font-weight:700}
+.meta{flex:none;margin-left:1ch;color:var(--fg-faint)}
+.pane{flex:none;margin-left:1ch;color:var(--fg-dim)}
+.time{flex:none;margin-left:1ch;color:var(--fg-dim);font-variant-numeric:tabular-nums}
+.l2,.l3{padding-left:3ch;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.l2{color:var(--fg-dim)}.l3{color:var(--fg-faint)}
+.br{color:var(--magenta)}.tl{color:var(--blue)}.lbl{color:var(--fg)}.bdg{color:var(--cyan)}
+.s-run .g{color:var(--blue)}
+.s-ask .g,.s-ask .time,.s-ask .lbl{color:var(--red)}
+.s-done .g,.s-done .time,.s-done .lbl{color:var(--yellow)}
+.s-idle .g{color:var(--fg-dim)}
+/* profile 行 = ランチャー。1 行。選択（hover）中は dir の代わりに 左 │ 右 のコマンドを出す */
+.p-row{padding-top:1px;padding-bottom:1px}
+.p-row .g{color:var(--fg-faint)}.p-row.sel .g{color:var(--cyan)}
+.p-row .name{flex:none;max-width:60%}
+.cpath,.csum{margin-left:1.5ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:0 100 auto}
+.cpath{color:var(--fg-faint)}
+.csum{display:none;color:var(--fg-dim)}
+.p-row.sel .cpath{display:none}.p-row.sel .csum{display:block}
+.p-row .time{color:var(--fg-faint)}
+.rn{color:var(--fg-hi);border-bottom:1px solid var(--cyan);width:100%}
+.empty{padding:4px 1.5ch 6px;color:var(--fg-dim)}
+.empty code{font:inherit;color:var(--fg)}
+
+/* groups（sessions と profiles で共通。dirs は sessions の自動振り分けにだけ使う） */
+.col-red{color:var(--red)}.col-orange{color:var(--yellow)}.col-green{color:var(--green)}.col-cyan{color:var(--cyan)}
+.col-blue{color:var(--blue)}.col-purple{color:var(--magenta)}.col-gray{color:var(--fg-dim)}
+.grp{display:flex;align-items:center;gap:1ch;padding:7px 1ch 1px;cursor:pointer;white-space:nowrap}
+.gsec:first-child .grp{padding-top:0}
+.grp .car{width:1ch;color:var(--fg-faint)}
+.grp .gn{font-weight:700;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.grp.ungrouped{cursor:default}.grp.ungrouped .gn{font-weight:400;color:var(--fg-faint)}
+.grp .rule{flex:1;min-width:2ch;border-top:1px solid var(--line)}
+.gcount{color:var(--fg-faint)}
+.gadd{display:none;color:var(--fg-dim)}.grp:hover .gadd{display:inline}.gadd:hover{color:var(--fg-hi)}
+.gempty{padding:0 1ch 3px 3ch;color:var(--fg-faint)}
+.gsec.drop{background:var(--bg-alt);outline:1px dashed var(--line-hi);outline-offset:-1px}
+/* グループの範囲: 見出しの ▾ から縦線を下ろし、最後の行の下で └ に閉じる（tree 表示と同じ読み方） */
+.gsec{--gc:var(--line-hi)}
+.gc-red{--gc:var(--red)}.gc-orange{--gc:var(--yellow)}.gc-green{--gc:var(--green)}.gc-cyan{--gc:var(--cyan)}
+.gc-blue{--gc:var(--blue)}.gc-purple{--gc:var(--magenta)}.gc-gray{--gc:var(--fg-dim)}
+.gbody{margin-left:1.5ch;border-left:1px solid color-mix(in srgb,var(--gc) 55%,transparent)}
+.gbody::after{content:"";display:block;width:1ch;border-bottom:1px solid color-mix(in srgb,var(--gc) 55%,transparent)}
+.gbody .row{padding-left:.5ch}
+.gbody .gempty{padding-left:1.5ch}
+.gsec+.gsec .grp{padding-top:10px}
+.dragging{opacity:.4}
+.gdrop{display:none}.drag-on .gdrop{display:block}
+.more{display:none;flex:none;margin-left:1ch;color:var(--fg-dim)}.more:hover{color:var(--fg-hi)}
+.row:hover .more,.row.sel .more{display:inline}
+.gsum{display:inline-flex;gap:1ch}.gsum>span{display:inline-flex;gap:.4ch}
+#slist .gsec+.gsec .grp{padding-top:6px}
+.row{-webkit-user-select:none;user-select:none}
+
+/* forms */
+#gform,#sform{padding:0 1ch 6px;margin-bottom:4px;border-bottom:1px solid var(--line)}
+.add-in{display:flex;gap:1ch}.add-in .p{color:var(--cyan)}.add-in input{flex:1}
+.frow{display:flex;align-items:baseline;gap:1ch;white-space:nowrap}
+.frow .k{width:5ch;flex:none;color:var(--fg-faint)}
+.frow .k2{width:3ch;flex:none;color:var(--fg-faint)}
+.frow input{flex:1;border-bottom:1px solid transparent}
+.frow input:focus{border-bottom-color:var(--line-hi)}
+.sug>div{display:flex;gap:1ch;padding:0 1ch 0 10ch;margin:0 -1ch;cursor:pointer;white-space:nowrap}
+.sug>div.on,.sug>div:hover{background:var(--bg-sel)}
+.sug .pth{overflow:hidden;text-overflow:ellipsis;min-width:0;color:var(--fg-dim)}
+.sug .n{margin-left:auto;color:var(--fg-faint);flex:none}
+.opt{display:flex;flex-wrap:wrap;gap:0 .5ch;margin-top:2px}
+.opt>.faint:first-child{display:inline-block;width:5ch;flex:none}
+.opt button{color:var(--fg-dim)}.opt button:hover{color:var(--fg)}
+.opt button::before,.opt button::after{content:" "}
+.opt button.on{color:var(--cyan)}.opt button.on::before{content:"["}.opt button.on::after{content:"]"}
+.hint{color:var(--fg-faint);display:flex;flex-wrap:wrap;column-gap:1.5ch}.hint kbd{color:var(--fg-dim)}
+.ferr{color:var(--red)}
+.gdirs .dl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--fg-dim)}
+.gdirs .x{flex:none;color:var(--fg-faint)}.gdirs .x:hover{color:var(--red)}
+#gform .sug>div{padding-left:7ch}
+.gnote{color:var(--fg-faint)}
+
+/* history */
+.hq{display:inline-flex;gap:.5ch;color:var(--fg-dim)}.hq input{width:12ch}
+.hg{color:var(--fg-faint);padding:5px 1ch 0}.hg:first-child{padding-top:0}
+.hr{display:flex;gap:1ch;padding:1px 1ch;cursor:pointer;white-space:nowrap}
+.hr:hover,.hr.open{background:var(--bg-alt)}
+.h-t{flex:none;color:var(--fg-dim);font-variant-numeric:tabular-nums}
+.h-w{flex:none;width:12ch;overflow:hidden;text-overflow:ellipsis}
+.h-x{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.h-live{margin-right:.5ch}.h-live.s-run{color:var(--blue)}.h-live.s-ask{color:var(--red)}.h-live.s-done{color:var(--yellow)}.h-live.s-idle{color:var(--fg-dim)}
+.hd{background:var(--bg-alt);padding:0 1ch 6px 7ch;color:var(--fg-dim);user-select:text;-webkit-user-select:text}
+.hd p{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:var(--fg)}
+.hd .q{color:var(--cyan)}.hd .a{color:var(--green)}
+.acts{display:flex;gap:1.5ch;margin-top:2px}
+.btn{color:var(--fg)}.btn::before{content:"[";color:var(--fg-faint)}.btn::after{content:"]";color:var(--fg-faint)}
+.btn:hover{color:var(--fg-hi)}
+
+/* footer */
+footer{flex:none;margin-top:8px;padding:3px 1.5ch 6px;border-top:1px solid var(--line)}
+#msg{min-height:1.6em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--fg-dim)}
+#msg.ok{color:var(--fg)}#msg.e{color:var(--red)}#msg.cf{color:var(--yellow)}
+.keys{color:var(--fg-faint);display:flex;flex-wrap:wrap;column-gap:1.5ch}.keys kbd{color:var(--fg-dim)}
+#multi{color:var(--cyan);display:flex;flex-wrap:wrap;column-gap:1.5ch}#multi kbd{color:var(--fg-hi)}
+
+/* overlays */
+.menu{position:fixed;z-index:10;background:var(--bg);border:1px solid var(--line-hi);padding:3px 0;min-width:24ch}
+.menu button{display:flex;gap:1ch;width:100%;padding:0 1.5ch 0 1ch;white-space:nowrap}
+.menu button:hover{background:var(--bg-sel)}
+.menu kbd{color:var(--fg-faint);width:1ch}
+.menu .danger{color:var(--red)}
+.menu hr{border:0;border-top:1px solid var(--line);margin:3px 0}
+.menu .mh{color:var(--fg-faint);padding:2px 1ch 0;white-space:nowrap}
+#help{position:fixed;left:0;right:0;bottom:44px;z-index:9;background:var(--bg);box-shadow:0 -16px 0 var(--bg)}  /* 上の帯も塗って、下の箱の見出しと重ならないようにする */
+#help .box-b{padding:0 1.5ch;display:grid;grid-template-columns:6ch 1fr;column-gap:1ch}
+#help kbd{color:var(--cyan)}
+#help .hh{grid-column:1/-1;color:var(--fg-faint);padding-top:4px}
+#help .hh:first-child{padding-top:0}
+
+@media (max-width:300px){.meta{display:none}.h-w{width:9ch}.cpath{display:none}}
+</style>
+</head>
+<body>
+<header>
+  <div class="hl"><span class="brand">saba-cli</span><span class="faint">panel</span><span class="fill"></span><span class="conn" id="conn"></span></div>
+  <div class="ctrs" id="ctrs"></div>
+</header>
+
+<section class="box" id="fault" hidden>
+  <div class="box-t"><span class="t">! error</span></div>
+  <div class="box-b" id="faultB"></div>
+</section>
+
+<section class="box" id="sess">
+  <div class="box-t">
+    <button class="t" data-col="sess"><span class="car">▾</span> sessions</button>
+    <span class="fill"></span>
+  </div>
+  <div class="box-b" id="slist"></div>
+</section>
+
+<section class="box" id="prof">
+  <div class="box-t">
+    <button class="t" data-col="prof"><span class="car">▾</span> profiles</button>
+    <span class="fill"></span>
+    <button class="tb when-open" id="grpBtn" title="new group (G)">+ group</button>
+    <button class="tb when-open" id="saveBtn" title="save the focused tab as a profile (s)">+ profile</button>
+  </div>
+  <div class="box-b">
+    <div id="gform" hidden>
+      <div class="add-in"><span class="p" id="gfP">group&gt;</span><input id="gfIn" spellcheck="false" autocomplete="off" placeholder="name"></div>
+      <div class="opt" id="gfC"></div>
+      <div class="gdirs" id="gfDirs"></div>
+      <div class="frow"><span class="k" id="gfDirK">dirs</span><input id="gfDir" class="dirin" data-sug="gfSug" spellcheck="false" autocomplete="off" placeholder="+ add a dir"></div>
+      <div class="sug" id="gfSug"></div>
+      <div class="gnote" id="gfNote"></div>
+      <div class="ferr" id="gfErr"></div>
+      <div class="hint" id="gfHint"></div>
+    </div>
+    <div id="sform" hidden>
+      <div class="add-in"><span class="p" id="sfP">save&gt;</span><input id="sfName" spellcheck="false" autocomplete="off" placeholder="profile name"></div>
+      <div class="frow"><span class="k">left</span><span class="k2">dir</span><input id="sfLDir" class="dirin" data-sug="sfLSug" spellcheck="false" autocomplete="off" placeholder="~/path/to/dir"></div>
+      <div class="sug" id="sfLSug"></div>
+      <div class="frow"><span class="k"></span><span class="k2">cmd</span><input id="sfLCmd" spellcheck="false" autocomplete="off" placeholder="shell only (e.g. claude --continue)"></div>
+      <div class="opt" id="sfSplit"></div>
+      <div id="sfRight">
+        <div class="frow"><span class="k"></span><span class="k2">dir</span><input id="sfRDir" class="dirin" data-sug="sfRSug" spellcheck="false" autocomplete="off" placeholder="same as left"></div>
+        <div class="sug" id="sfRSug"></div>
+        <div class="frow"><span class="k"></span><span class="k2">cmd</span><input id="sfRCmd" spellcheck="false" autocomplete="off" placeholder="shell only"></div>
+        <div class="opt" id="sfRatio"></div>
+      </div>
+      <div class="opt" id="sfGroup"></div>
+      <div class="ferr" id="sfErr"></div>
+      <div class="hint"><span><kbd>⏎</kbd> save</span><span><kbd>tab</kbd> complete dir</span><span><kbd>esc</kbd> cancel</span></div>
+    </div>
+    <div id="plist"></div>
+  </div>
+</section>
+
+<section class="box" id="hist">
+  <div class="box-t">
+    <button class="t" data-col="hist"><span class="car">▾</span> history</button>
+    <span class="fill"></span>
+    <button class="tb when-open" id="scope" title="scope: all / the selected dir (h)"></button>
+    <label class="hq when-open"><span>/</span><input id="q" spellcheck="false" autocomplete="off" placeholder="filter"></label>
+  </div>
+  <div class="box-b" id="hlist"></div>
+</section>
+
+<footer>
+  <div id="multi" hidden></div>
+  <div id="msg"></div>
+  <div class="keys"><span><kbd>↑↓</kbd> move</span><span><kbd>⏎</kbd> focus/open</span><span><kbd>s</kbd> save tab</span><span><kbd>g</kbd> group</span><span><kbd>⇧/⌃click</kbd> multi</span><span><kbd>/</kbd> find</span><span><kbd>?</kbd> keys</span></div>
+</footer>
+
+<section class="box" id="help" hidden>
+  <div class="box-t"><span class="t">keys</span><span class="fill"></span><button class="tb" id="helpX">esc</button></div>
+  <div class="box-b">
+    <span class="hh">sessions — running agents</span>
+    <kbd>↑↓ jk</kbd><span>select (sessions, then profiles)</span>
+    <kbd>⏎</kbd><span>focus that pane</span>
+    <kbd>s</kbd><span>save its tab as a profile</span>
+    <kbd>g</kbd><span>move to group (remembered for its dir)</span>
+    <kbd>G</kbd><span>new group from its dir</span>
+    <kbd>drag</kbd><span>drop a session on a group</span>
+    <span class="hh">profiles — tab shortcuts</span>
+    <kbd>⏎</kbd><span>open a new tab (every time)</span>
+    <kbd>e</kbd><span>edit (dirs / commands / group)</span>
+    <kbd>r</kbd><span>rename</span>
+    <kbd>d</kbd><span>delete (open tabs stay)</span>
+    <kbd>g</kbd><span>move to group</span>
+    <kbd>G</kbd><span>new group (moves it in)</span>
+    <kbd>drag</kbd><span>drop a profile on a group</span>
+    <span class="hh">multi-select — within one box</span>
+    <kbd>⇧click</kbd><span>select a range</span>
+    <kbd>⌃click</kbd><span>add / remove one (⌘click too)</span>
+    <kbd>⇧↑↓</kbd><span>extend the range</span>
+    <kbd>g G</kbd><span>move all / new group from all</span>
+    <kbd>⏎ d</kbd><span>profiles: open all / delete all</span>
+    <kbd>esc</kbd><span>clear the selection</span>
+    <span class="hh">groups — shared by sessions and profiles</span>
+    <kbd>dirs</kbd><span>sessions under them join on their own; a manual move wins</span>
+    <span class="hh">anywhere</span>
+    <kbd>h</kbd><span>history for the selected dir</span>
+    <kbd>/</kbd><span>filter history</span>
+    <kbd>right</kbd><span>click a row / group for more</span>
+  </div>
+</section>
+
+<script>
+(() => {
+'use strict';
+
+/* ---------- utils ---------- */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const qs = new URLSearchParams(location.search);
+const MOCK = location.protocol === 'file:' || qs.has('mock');
+const STILL = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const SPIN = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
+const GLYPH = { ask: '!', done: '●', idle: '○' };
+const PANE = ['◧', '◨', '▣'];   // 同じタブに agent が 2 つ以上ある時だけ出す（左 / 右 / それ以外）
+const GCOLORS = ['purple', 'cyan', 'green', 'blue', 'orange', 'red', 'gray'];  // グループ色。新規の既定は先頭から未使用の色（状態色とかぶる blue/orange/red は後ろ）
+const RATIOS = [50, 60, 70];
+const now = () => Date.now() / 1000;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const trim = p => String(p || '').replace(/\/+$/, '') || '/';
+const base = p => trim(p).split('/').pop();
+const tilde = p => String(p || '').replace(/^\/Users\/[^/]+(?=\/|$)/, '~');
+const nk = p => tilde(trim(p));   // dir の比較用（~ に揃え、末尾 / を落とす）
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+/* dir ルール: cwd がグループの dirs のどれかと一致するか配下なら、そのグループ（最長一致）。daemon も同じ規則 */
+function matchDir(groups, cwd) {
+  const c = nk(cwd);
+  let best = null, len = -1;
+  for (const g of groups) for (const d of g.dirs || []) {
+    const x = nk(d);
+    if ((c === x || c.startsWith(x + '/')) && x.length > len) { best = g; len = x.length; }
+  }
+  return best;
+}
+const pad = n => String(n).padStart(2, '0');
+function dur(sec, fine) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60), h = Math.floor(m / 60), d = Math.floor(h / 24);
+  if (d) return `${d}d`;
+  if (h) return fine ? `${h}h${pad(m % 60)}m` : `${h}h`;
+  if (m) return fine ? `${m}m${pad(sec % 60)}s` : `${m}m`;
+  return `${sec}s`;
+}
+const hhmm = t => { const d = new Date(t * 1000); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+function day(t) {
+  const d = new Date(t * 1000), a = new Date(d), b = new Date();
+  a.setHours(0, 0, 0, 0); b.setHours(0, 0, 0, 0);
+  const n = Math.round((b - a) / 864e5);
+  if (n <= 0) return 'today';
+  if (n === 1) return 'yesterday';
+  return `${d.getMonth() + 1}/${d.getDate()} ${'sun mon tue wed thu fri sat'.split(' ')[d.getDay()]}`;
+}
+/* 同じ basename の dir は、違いが出る親ディレクトリを前に付ける（spike の _disambiguate と同じ規則）。
+   比較対象は「知っている dir 全部」（sessions / history / profiles）。daemon も同じ規則で name を作る想定 */
+function nameMap(cwds) {
+  const by = {}, m = {};
+  [...new Set(cwds.map(trim))].forEach(c => { (by[base(c)] = by[base(c)] || []).push(c); });
+  for (const [n, same] of Object.entries(by)) {
+    const parts = same.map(c => c.split('/')), min = Math.min(...parts.map(p => p.length));
+    let i = -1;
+    if (same.length > 1) for (let k = 0; k < min; k++) if (new Set(parts.map(p => p[k])).size > 1) { i = k; break; }
+    same.forEach((c, j) => { const p = parts[j]; m[c] = i < 0 ? n : i === p.length - 2 ? `${p[i]}/${n}` : `${p[i]}/…/${n}`; });
+  }
+  return m;
+}
+
+/* ---------- data sources ----------
+   snapshot = {
+     active: sessionId|null,                  // フォーカス中のペインが agent セッションならその id
+     fault: {title, detail, hint}|null,       // daemon が iTerm2 API で失敗した時
+     sessions: [{id, tab, name, cwd, agent, branch, dirty, state, since, tool, arg, prompt, message, group, group_src}],
+                                              // ペイン単位。iTerm2 のタブ順。id = iTerm2 session id
+                                              // group はサーバで解決済み: 手動上書き（cwd 単位）→ dirs の最長一致 → null
+                                              // group_src = 'manual' | 'dir' | null
+     groups: [{id, name, color, collapsed, collapsed_sessions, dirs}],
+                                              // sessions と profiles で共通。表示順。color は GCOLORS のキー
+                                              // collapsed = profiles 欄 / collapsed_sessions = sessions 欄の畳み
+                                              // dirs = この dir（~ 可）の配下で動くセッションは自動でこのグループ
+     profiles: [{id, name, group, left:{cwd, cmd}, right:{cwd, cmd}|null, ratio, last_used}],
+     history: [{id, cwd, name, agent, started, ended, title, first, last, branch, live}]   // live = 生きている sessionId|null
+   }
+   state: run | ask | done | idle
+   action（POST /api/action {op, ...} → {msg} | {error}）:
+     focus{id} open{id} capture{from} → {profile} save{id|null, name, group, left, right, ratio}
+     profile.delete{id} profile.move{id, group} profile.update{id, dir}
+     session.move{id, group: gid|null|'auto'}   // その cwd の手動上書き（null = 明示的に ungrouped）。'auto' で上書きを消す
+     group.create{name, color, dirs?, move?, move_session?}
+     group.update{gid, name?, color?, collapsed?, collapsed_sessions?, dir?, dirs?}
+     group.delete{gid}（そのグループを指す手動上書きも消す） group.open{gid}
+     resume{hid}
+   複数選択の一括操作は、クライアントが上の op を 1 件ずつ順に呼ぶ（専用の op は無い） */
+function httpSource() {
+  const token = qs.get('t') || '';
+  const H = { 'Content-Type': 'application/json', 'X-Saba-Token': token };
+  const down = d => ({ title: 'daemon unreachable', detail: d, hint: 'saba-cli panel doctor' });
+  let onData, onNet;
+  async function load() {
+    try {
+      const r = await fetch('/api/state', { headers: H });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      onData(await r.json()); onNet(null);
+    } catch (e) { onNet(down(String(e.message || e))); }
+  }
+  return {
+    start(fd, fn) {
+      onData = fd; onNet = fn;
+      const es = new EventSource(`/api/events?t=${encodeURIComponent(token)}`);
+      es.addEventListener('state', ev => { try { onData(JSON.parse(ev.data)); onNet(null); } catch (e) { onNet(down('bad event payload')); } });
+      es.onopen = load;                                  // 再接続のたびに全量取り直す
+      es.onerror = () => onNet(down('event stream lost — reconnecting'));
+    },
+    async act(op, args = {}) {
+      const r = await fetch('/api/action', { method: 'POST', headers: H, body: JSON.stringify({ op, ...args }) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+      return j;
+    },
+    async complete(p) {
+      try { const r = await fetch(`/api/complete?p=${encodeURIComponent(p)}`, { headers: H }); return r.ok ? r.json() : []; }
+      catch { return []; }
+    },
+  };
+}
+
+function mockSource() {
+  const t = now(), W = '~/wkspaces';
+  const U1 = `${W}/Acme-Unity_1/Acme/Assets/Codes`, U3 = `${W}/Acme-Unity_3/Acme/Assets/Codes`;
+  let seq = 0, nextTab = 16;
+  const hex = () => Math.random().toString(16).slice(2, 10).padEnd(8, '0');
+  const rid = p => `${p}-${(++seq).toString(36)}${hex().slice(0, 4)}`;
+  const ss = (agent, state, ago, o) => ({ id: rid('s'), agent, state, since: t - ago, tool: '', arg: '', prompt: '', message: '', ...o });
+  // iTerm2 側のタブ（モック内部だけの形）。panes[i].s があればそのペインで agent が動いている
+  const S = {
+    active: null, fault: null,
+    tabs: [
+      { id: '6', ratio: 50, panes: [
+        { cwd: U1, job: 'claude', branch: 'feature/login-bonus', dirty: true,
+          s: ss('claude', 'run', 75, { tool: 'Edit', arg: 'LoginBonusPresenter.cs', prompt: 'PR #128 のレビューコメント対応して' }) },
+        { cwd: U1, job: 'fish' }] },
+      { id: '9', ratio: 50, panes: [
+        { cwd: `${W}/memo`, job: 'claude', branch: 'main',
+          s: ss('claude', 'done', 190, { message: '週報を3件に整理して notes/ に保存しました', prompt: '今週の週報まとめて' }) },
+        { cwd: '~', job: 'fish' }] },
+      { id: '10', ratio: 50, panes: [
+        { cwd: `${W}/journal-web`, job: 'claude', branch: 'develop',
+          s: ss('claude', 'ask', 42, { tool: 'Bash', arg: 'git push origin develop', prompt: 'ログイン API のエラー処理を直して' }) },
+        { cwd: `${W}/journal-web`, job: 'fish' }] },
+      { id: '11', ratio: 50, panes: [
+        { cwd: `${W}/side-game`, job: 'claude', branch: 'main', s: ss('claude', 'idle', 2400, {}) }] },
+      { id: '15', ratio: 50, panes: [
+        { cwd: `${W}/saba_cli`, job: 'claude', branch: 'main', dirty: true,
+          s: ss('claude', 'run', 252, { tool: 'Edit', arg: 'docs/design/panel-mock.html', prompt: '右側のパネルを terminal っぽいデザインで作って' }) },
+        { cwd: `${W}/saba_cli`, job: 'codex', branch: 'main', dirty: true,
+          s: ss('codex', 'idle', 900, { message: 'レビュー指摘を 3 件返しました' }) }] },
+    ],
+    groups: [
+      { id: 'work', name: 'work', color: 'purple', collapsed: false, collapsed_sessions: false,
+        dirs: [`${W}/Acme-Unity_1`, `${W}/Acme-Unity_3`, `${W}/Acme-Unity_5`] },
+      { id: 'notes', name: 'notes', color: 'green', collapsed: false, collapsed_sessions: false, dirs: [`${W}/memo`] },
+      { id: 'tools', name: 'tools', color: 'cyan', collapsed: false, collapsed_sessions: false, dirs: [`${W}/saba_cli`] },
+    ],
+    overrides: { [`${W}/journal-web`]: 'notes' },   // 手で移したセッションの cwd → gid（'' = 明示的に ungrouped）
+  };
+  const T15 = S.tabs.find(tb => tb.id === '15');
+  S.active = T15.panes[0].s.id;
+  const pf = (name, group, cwd, cmd, right, ago) =>
+    ({ id: rid('p'), name, group, left: { cwd, cmd }, right, ratio: right ? 50 : null, last_used: ago == null ? null : t - ago });
+  S.profiles = [
+    pf('acme-1', 'work', U1, 'claude --continue', { cwd: U1, cmd: '' }, 3 * 3600),
+    pf('acme-3', 'work', U3, 'claude --continue', { cwd: U3, cmd: '' }, 26 * 3600),
+    pf('Journal', 'notes', `${W}/Journal`, 'claude --continue', { cwd: `${W}/Journal`, cmd: '' }, 2 * 86400),
+    pf('memo', 'notes', `${W}/memo`, 'claude --continue', { cwd: '~', cmd: '' }, 5 * 3600),
+    pf('saba_cli', 'tools', `${W}/saba_cli`, 'claude --continue', { cwd: `${W}/saba_cli`, cmd: 'codex resume --last' }, 3600),
+    pf('iceberg-theme', 'tools', `${W}/iceberg-theme`, 'nvim .', { cwd: `${W}/iceberg-theme`, cmd: '' }, 9 * 86400),
+    pf('dotfiles', null, '~/dotfiles', '', null, 12 * 86400),
+  ];
+  const live = cwd => S.tabs.flatMap(tb => tb.panes).find(p => p.s && p.cwd === cwd)?.s.id || null;
+  const H = (cwd, ago, len, title, first, last, branch, isLive, agent = 'claude') =>
+    ({ id: hex() + hex() + hex() + hex(), cwd, agent, started: t - ago * 60, ended: isLive ? null : t - (ago - len) * 60,
+       title, first, last, branch: branch || 'main', live: isLive ? live(cwd) : null });
+  S.history = [
+    H(`${W}/saba_cli`, 31, 31, 'iTerm2 統合パネルの設計', 'item2上でAIAgentのsessionを表示したりできるwindowを右側に常に表示しておけるツールを作成したいです', 'docs/design/iterm-panel.md に設計をまとめました', 'main', true),
+    H(U1, 14, 14, 'PR #128 のレビューコメント対応', 'PR #128 のレビューコメント対応して', 'コメント 6 件中 5 件を修正しました', 'feature/login-bonus', true),
+    H(`${W}/journal-web`, 8, 8, 'ログイン API のエラー処理', 'ログイン API のエラー処理を直して', 'push の許可待ちです', 'develop', true),
+    H(`${W}/memo`, 12, 12, '今週の週報まとめ', '今週の週報まとめて', '週報を3件に整理して notes/ に保存しました', 'main', true),
+    H(`${W}/saba_cli`, 190, 48, 'tree TUI に詳細ペインを追加', 'tree の右側にコミットの詳細を出したい', '詳細ペインを Tab で切り替えられるようにしました'),
+    H(U3, 320, 35, 'Notification hook の調査', 'Notification hook がどこで呼ばれてるか調べて', 'src/hooks/notify.ts から 3 箇所で呼ばれています', 'develop'),
+    H('~/dotfiles', 1500, 20, 'fish の補完を追加', 'saba-cli の fish 補完を書いて', 'completions/saba-cli.fish を追加しました'),
+    H(U1, 1620, 95, 'ログインボーナス API 実装', 'ログインボーナスの API を実装して', 'エンドポイントとテストを追加しました', 'feature/login-bonus'),
+    H(`${W}/Journal`, 2950, 12, 'README の更新', 'README を最新の手順に直して', 'セットアップ手順を書き直しました'),
+    H(`${W}/iceberg-theme`, 4400, 30, 'light テーマの配色調整', 'light の青をもう少し濃く', 'blue を #2d539e に変更しました'),
+  ];
+  S.history.splice(1, 0, H(`${W}/saba_cli`, 15, 15, 'panel mock のレビュー', 'panel-mock.html をレビューして', 'レビュー指摘を 3 件返しました', 'main', false, 'codex'));
+  S.history[1].live = T15.panes[1].s.id; S.history[1].ended = null;
+  const DIRS = ['~', '~/dotfiles', '~/Downloads/tmp', `${W}/saba_cli`, `${W}/memo`, `${W}/Journal`, `${W}/journal-web`,
+    `${W}/iceberg-theme`, `${W}/side-game`, U1, U3, `${W}/Acme-Unity_5/Acme/Assets/Codes`];
+  const FAULT = { title: 'iterm2 api error — tab control unavailable', detail: "AttributeError: 'Session' object has no attribute 'async_activate'", hint: 'saba-cli panel logs' };
+  let emit = () => {};
+
+  function snap() {
+    const sessions = [];
+    S.tabs.forEach(tb => tb.panes.forEach(p => {
+      if (p.s) sessions.push({ id: p.s.id, tab: tb.id, name: '', cwd: p.cwd, branch: p.branch || null, dirty: !!p.dirty, ...p.s });
+    }));
+    const names = nameMap([...sessions.map(s => s.cwd), ...S.history.map(h => h.cwd), ...S.profiles.map(p => p.left.cwd)]);
+    sessions.forEach(s => { s.name = names[trim(s.cwd)]; [s.group, s.group_src] = resolve(s.cwd); });
+    const history = S.history.map(h => ({ ...h, name: names[trim(h.cwd)] }));
+    return JSON.parse(JSON.stringify({ active: S.active, fault: S.fault, sessions, groups: S.groups, profiles: S.profiles, history }));
+  }
+  const push = () => emit(snap());
+  const pane = id => { for (const tab of S.tabs) for (const p of tab.panes) if (p.s && p.s.id === id) return { tab, p }; return null; };
+  const need = () => { if (S.fault) throw new Error('tab control unavailable — iterm2 api error'); };
+  const grp = id => { const g = S.groups.find(x => x.id === id); if (!g) throw new Error('that group is gone'); return g; };
+  const prof = id => { const p = S.profiles.find(x => x.id === id); if (!p) throw new Error('that profile is gone'); return p; };
+  function resolve(cwd) {   // セッションのグループ: 手動上書き（cwd 単位）→ dirs の最長一致 → なし
+    const o = S.overrides[nk(cwd)];
+    if (o === '') return [null, 'manual'];
+    if (o && S.groups.some(g => g.id === o)) return [o, 'manual'];
+    const g = matchDir(S.groups, cwd);
+    return g ? [g.id, 'dir'] : [null, null];
+  }
+  function cleanDirs(list, self) {   // 空・末尾 / ・重複を除く。別グループの dir と同じものは受けない
+    const out = [];
+    for (const raw of list || []) {
+      if (!String(raw ?? '').trim()) continue;
+      const d = nk(String(raw).trim());
+      if (out.includes(d)) continue;
+      const other = S.groups.find(g => g !== self && (g.dirs || []).some(x => nk(x) === d));
+      if (other) throw new Error(`${d} is already in group ${other.name}`);
+      out.push(d);
+    }
+    return out;
+  }
+  const jobOf = cmd => (cmd || '').trim().split(/\s+/)[0] || 'fish';
+  const cmdOf = job => job === 'claude' ? 'claude --continue' : job === 'codex' ? 'codex resume --last' : ['fish', 'zsh', 'bash', 'sh'].includes(job) ? '' : job;
+  const known = d => d === '~' || DIRS.includes(trim(d)) || S.profiles.some(p => p.left.cwd === d || p.right?.cwd === d);
+  const sum = p => `${p.left.cmd || 'shell'}${p.right ? ` │ ${p.right.cmd || 'shell'}` : ''}`;
+  function openProfile(p) {   // 押すたびに新しいタブ。left/right のコマンドが agent ならそのペインがセッションになる
+    p.last_used = now();
+    const tab = { id: String(nextTab++), ratio: p.ratio || 50, panes: [{ cwd: p.left.cwd, job: jobOf(p.left.cmd), branch: 'main' }] };
+    if (p.right) tab.panes.push({ cwd: p.right.cwd, job: jobOf(p.right.cmd), branch: 'main' });
+    tab.panes.forEach((x, i) => {
+      if (x.job !== 'claude' && x.job !== 'codex') return;
+      const c = i ? p.right.cmd : p.left.cmd;
+      x.s = ss(x.job, 'idle', 0, { message: /--continue|resume/.test(c) ? 'continued last session' : '' });
+    });
+    S.tabs.push(tab);
+    const first = tab.panes.find(x => x.s); if (first) S.active = first.s.id;
+  }
+
+  // 生きてる感じを出すための擬似イベント
+  const steps = [['Read', 'src/saba_cli/panel/server.py'], ['Grep', 'async_activate'], ['Bash', 'python -m pytest -q'], ['Edit', 'src/saba_cli/panel/layout.py'], ['', '']];
+  let k = 0;
+  setInterval(() => {
+    const a = S.tabs.find(tb => tb.id === '15')?.panes[0].s, b = S.tabs.find(tb => tb.id === '6')?.panes[0].s;
+    if (a?.state === 'run') [a.tool, a.arg] = steps[k++ % steps.length];
+    if (b?.state === 'run' && now() - t > 24) Object.assign(b, { state: 'done', since: now(), tool: '', message: 'コメント 6 件をすべて修正しました' });
+    push();
+  }, 5000);
+
+  return {
+    toggleFault() { S.fault = S.fault ? null : FAULT; push(); },
+    setFault() { S.fault = FAULT; },
+    startup() { S.tabs = []; S.active = null; S.history.forEach(h => { if (h.live) { h.live = null; h.ended = now() - 600; } }); },
+    mutate(f) { f(S); push(); },
+    start(fd) { emit = fd; push(); },
+    async complete(p) {
+      const used = new Set(S.profiles.flatMap(x => [x.left.cwd, x.right?.cwd]).filter(Boolean));
+      const all = [...new Set([...S.tabs.flatMap(tb => tb.panes.map(x => x.cwd)), ...DIRS])];
+      const q = p.trim().replace(/^~\/?/, '').toLowerCase();
+      return all.filter(d => d !== p.trim() && d.toLowerCase().includes(q))
+        .map(d => ({ path: d, note: used.has(d) ? 'profile' : S.tabs.some(tb => tb.panes.some(x => x.cwd === d)) ? 'open' : '' }));
+    },
+    async act(op, a = {}) {
+      await sleep(60);
+      let msg = '';
+      const extra = {};
+      switch (op) {
+        case 'focus': {
+          need(); const x = pane(a.id); if (!x) throw new Error('that pane is gone');
+          S.active = a.id; if (x.p.s.state === 'done') Object.assign(x.p.s, { state: 'idle', since: now() });   // your turn を見たら idle
+          msg = `focused ${base(x.p.cwd)}${x.tab.panes.filter(z => z.s).length > 1 ? ` · ${x.tab.panes.indexOf(x.p) ? 'right' : 'left'} pane` : ''}`; break;
+        }
+        case 'open': { need(); const p = prof(a.id); openProfile(p); msg = `opened ${p.name} · new tab`; break; }
+        case 'capture': {   // 保存フォームの初期値。from=null はフォーカス中のタブ
+          need();
+          const x = pane(a.from || S.active), tb = x ? x.tab : S.tabs[S.tabs.length - 1];
+          if (!tb) throw new Error('no tab to capture — open one first, or type the dirs');
+          const [l, r] = tb.panes;
+          extra.profile = { name: base(l.cwd), left: { cwd: l.cwd, cmd: cmdOf(l.job) }, right: r ? { cwd: r.cwd, cmd: cmdOf(r.job) } : null, ratio: r ? tb.ratio : null };
+          break;
+        }
+        case 'save': {
+          const name = (a.name || '').trim();
+          if (!name) throw new Error('type a name');
+          if (S.profiles.some(p => p.name === name && p.id !== a.id)) throw new Error(`profile "${name}" already exists`);
+          for (const d of [a.left?.cwd, a.right?.cwd]) if (d && !known(d)) throw new Error(`no such directory: ${d}`);
+          const body = { name, group: a.group || null, left: { cwd: a.left.cwd, cmd: a.left.cmd || '' },
+            right: a.right ? { cwd: a.right.cwd || a.left.cwd, cmd: a.right.cmd || '' } : null, ratio: a.right ? (a.ratio || 50) : null };
+          if (a.id) { Object.assign(prof(a.id), body); msg = `updated ${name}`; }
+          else { S.profiles.push({ id: rid('p'), last_used: null, ...body }); msg = `saved ${name} · ${sum(body)}`; }
+          break;
+        }
+        case 'profile.delete': { const p = prof(a.id); S.profiles = S.profiles.filter(x => x !== p); msg = `deleted ${p.name} (open tabs stay)`; break; }
+        case 'profile.move': { const p = prof(a.id); p.group = a.group || null; msg = `moved ${p.name} → ${a.group ? grp(a.group).name : 'ungrouped'}`; break; }
+        case 'profile.update': {
+          const p = prof(a.id);
+          if (a.dir) {   // 同じグループの中で並べ替える
+            const same = S.profiles.filter(x => (x.group || null) === (p.group || null)), j = same.indexOf(p) + a.dir;
+            if (j >= 0 && j < same.length) { const ai = S.profiles.indexOf(p), bi = S.profiles.indexOf(same[j]); [S.profiles[ai], S.profiles[bi]] = [S.profiles[bi], S.profiles[ai]]; }
+          }
+          break;
+        }
+        case 'session.move': {   // 手で移す = その cwd を覚える。'auto' で dir ルールに戻す
+          const x = pane(a.id); if (!x) throw new Error('that pane is gone');
+          const c = nk(x.p.cwd), nm = snap().sessions.find(z => z.id === a.id)?.name || base(c);
+          if (a.group === 'auto') {
+            delete S.overrides[c];
+            const g = matchDir(S.groups, c);
+            msg = `${nm} → ${g ? g.name : 'ungrouped'} (by dir)`;
+          } else if (a.group) {
+            const g = grp(a.group); S.overrides[c] = g.id;
+            msg = `moved ${nm} → ${g.name} · remembered for ${c}`;
+          } else { S.overrides[c] = ''; msg = `moved ${nm} → ungrouped · remembered for ${c}`; }
+          break;
+        }
+        case 'group.create': {
+          const name = (a.name || '').trim();
+          if (!name) throw new Error('type a name');
+          if (S.groups.some(g => g.name === name)) throw new Error(`group "${name}" already exists`);
+          const dirs = cleanDirs(a.dirs, null);
+          const mp = a.move ? prof(a.move) : null, ms = a.move_session ? pane(a.move_session) : null;
+          if (a.move_session && !ms) throw new Error('that pane is gone');
+          const g = { id: rid('g'), name, color: GCOLORS.includes(a.color) ? a.color : 'purple', collapsed: false, collapsed_sessions: false, dirs };
+          S.groups.push(g);
+          const moved = [];
+          if (mp) { mp.group = g.id; moved.push(mp.name); }
+          if (ms) {   // dir ルールで既に入るなら上書きは作らない（後で dirs を変えた時に追従させるため）
+            if (resolve(ms.p.cwd)[0] !== g.id) S.overrides[nk(ms.p.cwd)] = g.id;
+            moved.push(base(ms.p.cwd));
+          }
+          msg = `created group ${name}${dirs.length ? ` · ${plural(dirs.length, 'dir')}` : ''}${moved.length ? ` · moved ${moved.join(', ')}` : ''}`; break;
+        }
+        case 'group.update': {
+          const g = grp(a.gid);
+          const name = a.name !== undefined ? String(a.name).trim() : undefined;
+          if (name !== undefined) {
+            if (!name) throw new Error('type a name');
+            if (S.groups.some(x => x !== g && x.name === name)) throw new Error(`group "${name}" already exists`);
+          }
+          const dirs = a.dirs !== undefined ? cleanDirs(a.dirs, g) : undefined;   // 検証してから書き換える
+          if (name !== undefined) { g.name = name; msg = `updated group ${name}`; }
+          if (dirs !== undefined) g.dirs = dirs;
+          if (a.color !== undefined) g.color = a.color;
+          if (a.collapsed !== undefined) g.collapsed = a.collapsed;
+          if (a.collapsed_sessions !== undefined) g.collapsed_sessions = a.collapsed_sessions;
+          if (a.dir) { const i = S.groups.indexOf(g), j = i + a.dir; if (j >= 0 && j < S.groups.length) [S.groups[i], S.groups[j]] = [S.groups[j], S.groups[i]]; }
+          break;
+        }
+        case 'group.delete': {
+          const g = grp(a.gid);
+          S.groups = S.groups.filter(x => x !== g);
+          S.profiles.forEach(x => { if (x.group === g.id) x.group = null; });
+          for (const [c, v] of Object.entries(S.overrides)) if (v === g.id) delete S.overrides[c];
+          msg = `deleted group ${g.name} (profiles → ungrouped, sessions → by dir)`; break;
+        }
+        case 'group.open': {
+          need(); const g = grp(a.gid), ps = S.profiles.filter(p => p.group === g.id);
+          if (!ps.length) throw new Error(`${g.name} has no profiles`);
+          ps.forEach(openProfile); msg = `opened ${ps.length} tab${ps.length > 1 ? 's' : ''} · ${g.name}`; break;
+        }
+        case 'resume': {   // live ならそのペインへ。終わっていれば新しいタブで --resume
+          need(); const h = S.history.find(x => x.id === a.hid); if (!h) throw new Error('that session is gone');
+          if (h.live && pane(h.live)) { S.active = h.live; msg = `focused ${base(h.cwd)}`; break; }
+          const s = ss(h.agent, 'idle', 0, { message: `resumed ${h.id.slice(0, 8)}` });
+          S.tabs.push({ id: String(nextTab++), ratio: 50, panes: [{ cwd: h.cwd, job: h.agent, branch: h.branch, s }, { cwd: h.cwd, job: 'fish' }] });
+          S.active = s.id; h.live = s.id; h.ended = null;
+          msg = `resumed ${h.id.slice(0, 8)} in a new tab · ${h.agent} --resume`; break;
+        }
+        default: throw new Error(`unknown op: ${op}`);
+      }
+      push();
+      return { msg, ...extra };
+    },
+  };
+}
+
+/* ---------- ui state ---------- */
+const src = MOCK ? mockSource() : httpSource();
+const ui = { sel: null, hist: null, q: '', scope: 'all', renaming: null, confirm: null, cycle: {}, dragging: null,
+             multi: new Set(), anchor: null, lastPick: null };   // multi = 複数選択（1 つの欄の中だけ）。anchor = ⇧ 範囲の起点
+let D = { active: null, fault: null, sessions: [], groups: [], profiles: [], history: [] };
+let net = null, frame = 0, msgTimer = 0;
+const norm = d => ({ active: d.active ?? null, fault: d.fault ?? null, sessions: d.sessions || [], groups: d.groups || [], profiles: d.profiles || [], history: d.history || [] });
+
+const glyph = st => st === 'run' ? (STILL ? '●' : SPIN[frame]) : GLYPH[st] || '○';
+const sById = id => D.sessions.find(s => s.id === id);
+const pById = id => D.profiles.find(p => p.id === id);
+const gById = id => D.groups.find(g => g.id === id);
+const keyOf = (kind, id) => `${kind}:${id}`;
+const parseKey = k => (k ? { kind: k[0], id: k.slice(2) } : null);
+const isSel = key => (ui.multi.size ? ui.multi.has(key) : ui.sel === key);   // 複数選択中はカーソルでなく選択を塗る
+function selected() { const k = parseKey(ui.sel); if (!k) return {}; return k.kind === 's' ? { s: sById(k.id) } : { p: pById(k.id) }; }
+const profByCwd = cwd => D.profiles.filter(p => trim(p.left.cwd) === trim(cwd));
+const cwdColor = cwd => { const g = gById(profByCwd(cwd)[0]?.group); return g ? `col-${g.color}` : ''; };
+const cmdSum = p => `${p.left.cmd || 'shell'}${p.right ? ` │ ${p.right.cmd || 'shell'}` : ''}`;
+
+function flash(text, kind = 'ok') {
+  ui.confirm = null;
+  const m = $('#msg'); m.className = kind; m.textContent = text;
+  clearTimeout(msgTimer); msgTimer = setTimeout(() => { if (!ui.confirm) { m.textContent = ''; m.className = ''; } }, 4000);
+}
+function confirmAsk(text, yes) {
+  clearTimeout(msgTimer);
+  ui.confirm = yes;
+  const m = $('#msg'); m.className = 'cf';
+  m.innerHTML = `${esc(text)} <button class="btn" data-cf="y">y</button> <button class="btn" data-cf="n">N</button>`;
+}
+async function run(op, args) {
+  try { const r = await src.act(op, args); if (r?.msg) flash(r.msg); return r || {}; }
+  catch (e) { flash(`error: ${e.message || e}`, 'e'); return null; }
+}
+
+/* ---------- render ---------- */
+function render() { pruneMulti(); renderHeader(); renderFault(); renderSessions(); renderProfiles(); renderHistory(); drawMulti(); }
+
+function renderHeader() {
+  const c = { run: 0, ask: 0, done: 0, idle: 0 };
+  D.sessions.forEach(s => { if (s.state in c) c[s.state]++; });
+  $('#ctrs').innerHTML = ['run', 'ask', 'done', 'idle'].map(k =>
+    `<button class="ctr k-${k}${c[k] ? '' : ' zero'}" data-jump="${k}" title="${c[k] ? `focus next ${k}` : ''}">` +
+    `<span class="g"${k === 'run' && c[k] ? ' data-spin' : ''} style="width:auto">${glyph(k)}</span><b>${c[k]}</b><span>${k}</span></button>`).join('');
+  const f = net || D.fault, cn = $('#conn');
+  cn.className = 'conn' + (MOCK ? ' mock' : f ? ' bad' : '');
+  cn.innerHTML = MOCK ? '<i>●</i> mock' : f ? '<i>●</i> error' : '<i>●</i> live';
+}
+function renderFault() {
+  const f = net || D.fault;
+  $('#fault').hidden = !f;
+  if (!f) return;
+  $('#faultB').innerHTML = `<div class="m">${esc(f.title)}</div>` +
+    (f.detail ? `<div class="d" title="${esc(f.detail)}">${esc(f.detail)}</div>` : '') +
+    `<div>showing last known state</div>` +
+    (f.hint ? `<div><span class="faint">$</span> <span class="m">${esc(f.hint)}</span></div>` : '');
+}
+
+/* sessions: ペイン単位・タブ順。グループは手動上書きか dir ルールで決まる（サーバで解決済み） */
+function line2(s, st) {
+  const br = s.branch ? `<span class="br">${esc(s.branch)}${s.dirty ? '*' : ''}</span> <span class="faint">·</span> ` : '';
+  let b;
+  const RUN_BADGE = { compiling: 1, testing: 1, building: 1, playing: 1, unity: 1 };   // spike の画面判定が message に入れる待ちの種類
+  const bdg = st === 'run' && RUN_BADGE[s.message] ? `<span class="bdg">[${esc(s.message)}]</span> ` : '';
+  if (st === 'run' && s.tool === 'waiting') b = `<span class="lbl">waiting</span> ${esc(s.arg || s.message || 'background tasks')}`;
+  else if (st === 'run' && s.tool === 'compacting') b = `<span class="lbl">compacting…</span>`;
+  else if (st === 'run') b = bdg + (s.tool ? `<span class="tl">${esc(s.tool)}</span> ${esc(s.arg || '')}` : 'thinking…');
+  else if (st === 'ask' && s.tool === 'question') b = `<span class="lbl">question</span> ${esc(s.message || s.arg || '')}`;
+  else if (st === 'ask' && s.tool === 'plan') b = `<span class="lbl">plan approval</span> ${esc(s.message || '')}`;
+  else if (st === 'ask') b = `<span class="lbl">needs approval</span> ${esc(s.tool || '')} ${esc(s.arg || '')}`;
+  else if (st === 'done') b = `<span class="lbl">your turn</span> ${esc(s.message || '')}`;
+  else b = esc(s.message || 'ready');
+  return `<div class="l2">${br}${b}</div>`;
+}
+function sessRow(s, paneMark) {
+  const st = s.state || 'idle', key = keyOf('s', s.id), fine = st === 'run' || st === 'ask';
+  const cls = `row s-${st}${D.active === s.id ? ' active' : ''}${isSel(key) ? ' sel' : ''}`;
+  const time = s.since ? `<span class="time" data-since="${s.since}"${fine ? ' data-fine' : ''}>${dur(now() - s.since, fine)}</span>` : '';
+  const l3 = s.prompt && (fine || st === 'done') ? `<div class="l3">› ${esc(s.prompt)}</div>` : '';
+  return `<div class="${cls}" data-kind="s" data-id="${esc(s.id)}" data-key="${esc(key)}" draggable="true" title="${esc(tilde(s.cwd))}">` +
+    `<div class="l1"><span class="g"${st === 'run' ? ' data-spin' : ''}>${glyph(st)}</span><span class="name">${esc(s.name || base(s.cwd))}</span>` +
+    `<span class="meta">${esc(s.agent || '')}</span>${paneMark}<span class="fill"></span><button class="more" data-act="more" title="menu (or right-click)">⋯</button>${time}</div>` +
+    `${line2(s, st)}${l3}</div>`;
+}
+function sgrpHead(g, ss) {
+  let sum = '';
+  if (g.collapsed_sessions) {                           // 畳んでいても ask / done / run を見落とさない
+    const c = { ask: 0, done: 0, run: 0 };
+    ss.forEach(s => { if (s.state in c) c[s.state]++; });
+    sum = Object.keys(c).filter(k => c[k]).map(k =>
+      `<span class="k-${k}"><span class="g"${k === 'run' ? ' data-spin' : ''} style="width:auto">${glyph(k)}</span>${c[k]}</span>`).join('');
+  }
+  return `<div class="grp" data-gid="${esc(g.id)}" data-where="s" title="click to ${g.collapsed_sessions ? 'expand' : 'collapse'} · right-click for more">` +
+    `<span class="car">${g.collapsed_sessions ? '▸' : '▾'}</span><span class="gn col-${esc(g.color)}">${esc(g.name)}</span>` +
+    `${sum ? `<span class="gsum">${sum}</span>` : ''}<span class="rule"></span><span class="gcount">${ss.length}</span></div>`;
+}
+function renderSessions() {
+  if (ui.dragging) return;                              // ドラッグ中は DOM を差し替えない（dragend で描き直す）
+  const L = D.sessions;
+  if (!L.length) {
+    $('#slist').innerHTML = `<div class="empty">no agent running.<br><span class="faint">open a profile below ↓</span></div>`;
+    return;
+  }
+  const per = {};
+  L.forEach(s => { (per[s.tab] = per[s.tab] || []).push(s); });
+  const row = s => {
+    const same = per[s.tab], i = same.indexOf(s);
+    const mark = same.length > 1
+      ? `<span class="pane" title="${['left', 'right'][i] || 'another'} pane — ${same.length} agents in this tab">${PANE[Math.min(i, 2)]}</span>` : '';
+    return sessRow(s, mark);
+  };
+  const G = D.groups.filter(g => L.some(s => s.group === g.id));   // セッションが 0 件のグループは出さない
+  let h = '';
+  if (!G.length) h = L.map(row).join('');               // どれもグループに入っていなければ見出しも出さない
+  else {
+    for (const g of G) {
+      const ss = L.filter(s => s.group === g.id);
+      h += `<div class="gsec gc-${esc(g.color)}" data-gid="${esc(g.id)}">${sgrpHead(g, ss)}` +
+        (g.collapsed_sessions ? '' : `<div class="gbody">${ss.map(row).join('')}</div>`) + `</div>`;
+    }
+    const ug = L.filter(s => !gById(s.group));
+    if (ug.length) h += `<div class="gsec" data-gid="">${grpHead(null, ug)}<div class="gbody">${ug.map(row).join('')}</div></div>`;
+  }
+  h += D.groups.filter(g => !G.includes(g)).map(g =>
+    `<div class="gsec gdrop gc-${esc(g.color)}" data-gid="${esc(g.id)}"><div class="grp"><span class="car">▸</span>` +
+    `<span class="gn col-${esc(g.color)}">${esc(g.name)}</span><span class="rule"></span><span class="gcount">drop here</span></div></div>`).join('');
+  $('#slist').innerHTML = h;
+}
+
+/* profiles: タブを開くショートカット。グループ所属は手動だけ（dir ルールは使わない） */
+function profTip(p) {
+  const r = p.right ? `right  ${p.right.cmd || 'shell'} @ ${tilde(p.right.cwd)}  (${p.ratio || 50}:${100 - (p.ratio || 50)})` : 'right  — (no split)';
+  return `click: open a new tab\nleft   ${p.left.cmd || 'shell'} @ ${tilde(p.left.cwd)}\n${r}`;
+}
+function profRow(p) {
+  const key = keyOf('p', p.id);
+  const name = ui.renaming === p.id
+    ? `<input class="rn" id="rn" value="${esc(p.name)}" spellcheck="false">`
+    : `<span class="name">${esc(p.name)}</span>`;
+  const time = p.last_used ? `<span class="time" data-ago="${p.last_used}" title="last opened">${dur(now() - p.last_used)}</span>` : '';
+  return `<div class="row p-row${isSel(key) ? ' sel' : ''}" data-kind="p" data-id="${esc(p.id)}" data-key="${esc(key)}" draggable="true" title="${esc(profTip(p))}">` +
+    `<div class="l1"><span class="g">▸</span>${name}<span class="cpath">${esc(tilde(p.left.cwd))}</span><span class="csum">${esc(cmdSum(p))}</span>` +
+    `<span class="fill"></span><button class="more" data-act="more" title="menu (or right-click)">⋯</button>${time}</div></div>`;
+}
+function grpHead(g, ps) {
+  if (!g) return `<div class="grp ungrouped"><span class="car"></span><span class="gn">ungrouped</span><span class="rule"></span><span class="gcount">${ps.length}</span></div>`;
+  return `<div class="grp" data-gid="${esc(g.id)}" data-where="p" title="click to ${g.collapsed ? 'expand' : 'collapse'} · right-click for more">` +
+    `<span class="car">${g.collapsed ? '▸' : '▾'}</span><span class="gn col-${esc(g.color)}">${esc(g.name)}</span><span class="rule"></span>` +
+    `<button class="gadd" data-gact="add" title="save the focused tab into ${esc(g.name)}">+</button><span class="gcount">${ps.length}</span></div>`;
+}
+function renderProfiles() {
+  if (ui.dragging) return;                              // ドラッグ中は DOM を差し替えない（dragend で描き直す）
+  const typing = ui.renaming && $('#rn') ? { v: $('#rn').value, s: $('#rn').selectionStart, e: $('#rn').selectionEnd } : null;
+  const G = D.groups, P = D.profiles;
+  let h = '';
+  if (!P.length && !G.length) {
+    h = `<div class="empty">no profiles yet.<br><button class="btn" data-act="save">+ profile</button> saves the focused tab, or<br>` +
+      `<span class="faint">$</span> <code>saba-cli save</code></div>`;
+  } else if (!G.length) h = P.map(profRow).join('');   // グループが無ければ見出しも出さない
+  else {
+    for (const g of G) {
+      const ps = P.filter(p => p.group === g.id);
+      h += `<div class="gsec gc-${esc(g.color)}" data-gid="${esc(g.id)}">${grpHead(g, ps)}` +
+        (g.collapsed ? '' : `<div class="gbody">${ps.length ? ps.map(profRow).join('') : `<div class="gempty">drop a profile here</div>`}</div>`) + `</div>`;
+    }
+    const ug = P.filter(p => !gById(p.group));
+    if (ug.length) h += `<div class="gsec" data-gid="">${grpHead(null, ug)}<div class="gbody">${ug.map(profRow).join('')}</div></div>`;
+  }
+  $('#plist').innerHTML = h;
+  if (ui.renaming) {
+    const r = $('#rn');
+    if (r) { if (typing) { r.value = typing.v; r.setSelectionRange(typing.s, typing.e); } else r.setSelectionRange(r.value.length, r.value.length); r.focus(); }
+  }
+}
+
+/* history */
+function histLabel(it) {   // 同じ dir の profile が 1 つだけならその名前（Unity プロジェクトの Codes などを見分けるため）
+  const ps = profByCwd(it.cwd);
+  return ps.length === 1 ? ps[0].name : (it.name || base(it.cwd));
+}
+function liveMark(it) {
+  const s = it.live && sById(it.live); if (!s) return '';
+  return `<span class="h-live s-${s.state}"${s.state === 'run' ? ' data-spin' : ''}>${glyph(s.state)}</span>`;
+}
+function renderHistory() {
+  const scoped = ui.scope !== 'all' && ui.scope;
+  $('#scope').textContent = scoped ? `[${histLabel({ cwd: scoped, name: base(scoped) })}]` : '[all]';
+  const q = ui.q.trim().toLowerCase();
+  let items = D.history.slice().sort((a, b) => b.started - a.started);
+  if (scoped) items = items.filter(h => trim(h.cwd) === trim(scoped));
+  if (q) items = items.filter(h => `${h.title} ${h.name} ${histLabel(h)} ${h.cwd} ${h.first} ${h.last} ${h.branch}`.toLowerCase().includes(q));
+  if (!items.length) { $('#hlist').innerHTML = `<div class="empty">${q ? `no sessions match “${esc(ui.q)}”` : scoped ? 'no sessions in this dir yet' : 'no history yet'}</div>`; return; }
+  let h = '', last = '';
+  for (const it of items) {
+    const g = day(it.started), open = ui.hist === it.id, isLive = !!(it.live && sById(it.live));
+    if (g !== last) { h += `<div class="hg">${g}</div>`; last = g; }
+    h += `<div class="hr${open ? ' open' : ''}" data-hid="${esc(it.id)}" title="${esc(tilde(it.cwd))}"><span class="h-t">${hhmm(it.started)}</span>` +
+      `<span class="h-w ${cwdColor(it.cwd)}">${esc(histLabel(it))}</span>` +
+      `<span class="h-x">${liveMark(it)}${esc(it.title)}</span></div>`;
+    if (open) {
+      const len = dur((it.ended || now()) - it.started, true);
+      h += `<div class="hd"><div>${esc(it.agent)} · ${isLive ? 'live' : len} · <span class="br">${esc(it.branch || '')}</span> · <span class="faint">${esc(it.id.slice(0, 8))}</span></div>` +
+        `<p><span class="q">›</span> ${esc(it.first)}</p><p><span class="a">‹</span> ${esc(it.last)}</p>` +
+        `<div class="acts"><button class="btn" data-hact="resume">⏎ ${isLive ? 'focus' : 'resume'}</button><button class="btn" data-hact="copy">copy id</button></div></div>`;
+    }
+  }
+  $('#hlist').innerHTML = h;
+}
+
+/* ---------- ticks ---------- */
+setInterval(() => {
+  const t = now();
+  $$('[data-since]').forEach(el => { el.textContent = dur(t - +el.dataset.since, 'fine' in el.dataset); });
+  $$('[data-ago]').forEach(el => { el.textContent = dur(t - +el.dataset.ago); });
+}, 1000);
+if (!STILL) setInterval(() => { frame = (frame + 1) % SPIN.length; $$('[data-spin]').forEach(el => { el.textContent = SPIN[frame]; }); }, 90);
+
+/* ---------- actions ---------- */
+const rowEl = key => $(`[data-key="${CSS.escape(key)}"]`);
+const visibleRows = () => $$('#slist [data-key], #plist [data-key]').filter(r => r.offsetParent);
+function paintSel() { $$('[data-key]').forEach(r => r.classList.toggle('sel', isSel(r.dataset.key))); drawMulti(); }
+function setSel(key) { ui.sel = key; paintSel(); }
+
+/* 複数選択（1 つの欄の中だけ）。⇧クリック = 範囲、⌃/⌘クリック = 1 件ずつ、⇧↑↓ = 範囲を伸ばす */
+const kindKeys = kind => visibleRows().filter(r => r.dataset.kind === kind).map(r => r.dataset.key);
+function clearMulti() { ui.anchor = null; if (!ui.multi.size) return; ui.multi.clear(); paintSel(); }
+function setRange(a, b) {
+  const keys = kindKeys(b[0]), j = keys.indexOf(b);
+  let i = keys.indexOf(a); if (i < 0) i = j;
+  ui.multi = new Set(keys.slice(Math.min(i, j), Math.max(i, j) + 1));
+}
+function pick(key, mode) {
+  if (mode === 'toggle') {   // ⌃クリックは環境によって click と contextmenu の両方から来るので、同じ行の続けての 2 回目は捨てる
+    const t = Date.now(), lp = ui.lastPick;
+    if (lp && lp.key === key && t - lp.t < 400) return;
+    ui.lastPick = { key, t };
+  }
+  const kind = key[0];
+  if (ui.multi.size && [...ui.multi][0][0] !== kind) ui.multi.clear();   // 別の欄なら選び直す
+  if (mode === 'toggle') { ui.multi.has(key) ? ui.multi.delete(key) : ui.multi.add(key); ui.anchor = key; }
+  else {
+    if (!ui.anchor || ui.anchor[0] !== kind || !rowEl(ui.anchor)) ui.anchor = key;
+    setRange(ui.anchor, key);
+  }
+  ui.sel = key; paintSel();
+}
+function extendSel(d) {
+  const cur = ui.sel && rowEl(ui.sel) ? ui.sel : null;
+  if (!cur) return moveSel(d);
+  const kind = cur[0], keys = kindKeys(kind), i = keys.indexOf(cur);
+  if (!ui.multi.size || !ui.anchor || ui.anchor[0] !== kind) ui.anchor = cur;
+  const n = keys[Math.max(0, Math.min(keys.length - 1, i + d))];
+  ui.sel = n; setRange(ui.anchor, n); paintSel(); rowEl(n)?.scrollIntoView({ block: 'nearest' });
+}
+function picked() {   // 一括操作の対象: 複数選択があればそれ、なければカーソルの 1 件
+  const keys = (ui.multi.size ? [...ui.multi] : ui.sel ? [ui.sel] : [])
+    .filter(k => { const { kind, id } = parseKey(k); return kind === 's' ? sById(id) : pById(id); });   // 消えた行は対象にしない
+  return { kind: keys[0]?.[0] || null, ids: keys.map(k => parseKey(k).id) };
+}
+function pruneMulti() {   // 終わったセッション・消えた profile は選択から外す
+  for (const k of [...ui.multi]) { const { kind, id } = parseKey(k); if (!(kind === 's' ? sById(id) : pById(id))) ui.multi.delete(k); }
+}
+function drawMulti() {
+  const el = $('#multi'), n = ui.multi.size, kind = [...ui.multi][0]?.[0];
+  el.hidden = !n;
+  if (!n) return;
+  el.innerHTML = `<span>${n} selected</span>` + (kind === 'p' ? '<span><kbd>⏎</kbd> open</span>' : '') +
+    '<span><kbd>g</kbd> move</span><span><kbd>G</kbd> new group</span>' +
+    (kind === 'p' ? '<span><kbd>d</kbd> delete</span>' : '') + '<span><kbd>esc</kbd> clear</span>';
+}
+async function bulk(op, ids, args, done) {   // 既存の op を 1 件ずつ呼ぶ。途中で失敗したらそこで止めて知らせる
+  let n = 0, last = '';
+  for (const id of ids) {
+    try { last = (await src.act(op, { id, ...args }))?.msg || ''; n++; }
+    catch (e) { flash(`error after ${n}/${ids.length}: ${e.message || e}`, 'e'); return n; }
+  }
+  flash(ids.length === 1 ? last : done(n));
+  return n;
+}
+const waitFor = async (f, ms = 2000) => { const t0 = Date.now(); for (;;) { const v = f(); if (v || Date.now() - t0 > ms) return v; await sleep(50); } };
+function moveTo(kind, ids, gid) {   // gid = グループ id | null（ungrouped）| 'auto'（sessions だけ: dir ルールに戻す）
+  const g = gid && gid !== 'auto' ? gById(gid) : null;
+  const label = gid === 'auto' ? 'their dir rules' : g ? g.name : 'ungrouped';
+  if (kind === 's') {
+    const todo = ids.filter(id => { const s = sById(id); return s && (gid === 'auto' ? s.group_src === 'manual' : (s.group || null) !== (gid || null)); });
+    if (!todo.length) { render(); return flash('nothing to move', ''); }
+    return bulk('session.move', todo, { group: gid }, n => `moved ${plural(n, 'session')} → ${label}${g ? ' · remembered per dir' : ''}`);
+  }
+  const todo = ids.filter(id => { const p = pById(id); return p && (p.group || null) !== (gid || null); });
+  if (!todo.length) { render(); return flash('nothing to move', ''); }
+  return bulk('profile.move', todo, { group: gid }, n => `moved ${plural(n, 'profile')} → ${label}`);
+}
+function openMany(ids) { flash(`opening ${plural(ids.length, 'tab')}…`, ''); return bulk('open', ids, {}, n => `opened ${plural(n, 'tab')} · new tabs`); }
+function deleteMany(ids) {
+  confirmAsk(`delete ${plural(ids.length, 'profile')}? open tabs stay`, () => bulk('profile.delete', ids, {}, n => `deleted ${plural(n, 'profile')} (open tabs stay)`));
+}
+function moveSel(d) {
+  const keys = visibleRows().map(r => r.dataset.key); if (!keys.length) return;
+  const i = keys.indexOf(ui.sel);
+  const n = keys[Math.max(0, Math.min(keys.length - 1, i < 0 ? (d > 0 ? 0 : keys.length - 1) : i + d))];
+  setSel(n); rowEl(n)?.scrollIntoView({ block: 'nearest' });
+}
+function openBox(id) { const b = $(`#${id}`); b.classList.remove('collapsed'); $(`[data-col="${id}"] .car`).textContent = '▾'; }
+function openProfile(p) { if (p) { flash(`opening ${p.name}…`, ''); return run('open', { id: p.id }); } }
+function activate(key) {
+  const k = parseKey(key); if (!k) return;
+  if (k.kind === 's') return run('focus', { id: k.id });
+  return openProfile(pById(k.id));
+}
+function deleteProfile(p) { if (p) confirmAsk(`delete profile ${p.name}? open tabs stay`, () => run('profile.delete', { id: p.id })); }
+function startRename(p) { if (p) { ui.renaming = p.id; renderProfiles(); } }
+async function commitRename(ok) {
+  const id = ui.renaming, v = $('#rn')?.value.trim(), p = pById(id);
+  ui.renaming = null;
+  if (ok && p && v && v !== p.name) await run('save', { id, name: v, group: p.group, left: p.left, right: p.right, ratio: p.ratio });
+  renderProfiles();
+}
+function scopeTo(cwd) { ui.scope = cwd || 'all'; openBox('hist'); renderHistory(); }
+function jump(state) {
+  const ids = D.sessions.filter(s => s.state === state).map(s => s.id);
+  if (!ids.length) return;
+  const i = ((ui.cycle[state] ?? -1) + 1) % ids.length; ui.cycle[state] = i;
+  setSel(keyOf('s', ids[i])); run('focus', { id: ids[i] });
+}
+
+/* context menu */
+let menuEl = null;
+const mi = (k, label, fn, cls = '') => ({ k, label, fn, cls });
+function closeMenu() { menuEl?.remove(); menuEl = null; }
+function showMenu(x, y, items) {
+  closeMenu();
+  menuEl = document.createElement('div'); menuEl.className = 'menu';
+  menuEl.innerHTML = items.map((m, i) => m === '-' ? '<hr>' : m.head ? `<div class="mh">${esc(m.head)}</div>`
+    : `<button data-i="${i}" class="${m.cls}"><kbd>${m.k}</kbd>${esc(m.label)}</button>`).join('');
+  menuEl.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; const m = items[+b.dataset.i]; closeMenu(); m.fn(); });
+  document.body.appendChild(menuEl);
+  const r = menuEl.getBoundingClientRect();
+  menuEl.style.left = `${Math.max(4, Math.min(x, innerWidth - r.width - 4))}px`;
+  menuEl.style.top = `${Math.max(4, Math.min(y, innerHeight - r.height - 4))}px`;
+}
+function sessionMenu(s) {
+  return [
+    mi('⏎', 'focus', () => run('focus', { id: s.id })),
+    mi('s', 'save this tab as profile…', () => openSaveForm({ from: s.id })),
+    mi('h', 'history for this dir', () => scopeTo(s.cwd)), '-',
+    { head: 'move to group' }, ...sessMoveItems([s.id]),
+  ];
+}
+function sessMoveItems(ids) {   // 手で移すと、そのセッションの dir を覚える。auto = dir ルールに戻す
+  const ss = ids.map(sById).filter(Boolean), all = gid => ss.every(s => (s.group || null) === gid);
+  const auto = ss.length === 1 ? matchDir(D.groups, ss[0].cwd) : null;
+  return [
+    ...D.groups.map(g => mi(all(g.id) ? '•' : '', g.name, () => moveTo('s', ids, g.id), `col-${g.color}`)),
+    ...(ss.some(s => s.group) ? [mi('', 'ungroup', () => moveTo('s', ids, null), 'dim')] : []),
+    ...(ss.some(s => s.group_src === 'manual')
+      ? [mi('', ss.length === 1 ? `auto (by dir → ${auto ? auto.name : 'none'})` : 'auto (by dir)', () => moveTo('s', ids, 'auto'), 'dim')] : []),
+    mi('+', ss.length > 1 ? `new group from ${ss.length}…` : 'new group…', () => openGroupForm({ items: { kind: 's', ids } })),
+  ];
+}
+function profileMenu(p, x, y) {
+  return [
+    mi('⏎', 'open (new tab)', () => openProfile(p)),
+    mi('e', 'edit…', () => openSaveForm({ id: p.id })),
+    mi('r', 'rename', () => startRename(p)),
+    mi('g', 'move to group…', () => showMenu(x, y, profMoveItems([p.id]))),
+    mi('↑', 'move up', () => run('profile.update', { id: p.id, dir: -1 })),
+    mi('↓', 'move down', () => run('profile.update', { id: p.id, dir: 1 })),
+    mi('h', 'history for this dir', () => scopeTo(p.left.cwd)), '-',
+    mi('d', 'delete', () => deleteProfile(p), 'danger'),
+  ];
+}
+function profMoveItems(ids) {
+  const ps = ids.map(pById).filter(Boolean), all = gid => ps.every(p => (p.group || null) === gid);
+  return [
+    ...D.groups.map(g => mi(all(g.id) ? '•' : '', g.name, () => moveTo('p', ids, g.id), `col-${g.color}`)),
+    ...(ps.some(p => p.group) ? [mi('', 'ungroup', () => moveTo('p', ids, null), 'dim')] : []),
+    '-', mi('+', ps.length > 1 ? `new group from ${ps.length}…` : 'new group…', () => openGroupForm({ items: { kind: 'p', ids } })),
+  ];
+}
+function multiMenu(kind, ids) {   // 複数選択中の右クリック
+  const n = ids.length, clear = mi('⎋', 'clear selection', clearMulti, 'dim');
+  if (kind === 's') return [{ head: `move ${n} sessions to group` }, ...sessMoveItems(ids), '-', clear];
+  return [
+    mi('⏎', `open ${n} (new tabs)`, () => openMany(ids)), '-',
+    { head: `move ${n} profiles to group` }, ...profMoveItems(ids), '-',
+    mi('d', `delete ${n}…`, () => deleteMany(ids), 'danger'), clear,
+  ];
+}
+function groupMenu(g, where) {   // where = 's'（sessions 欄の見出し）| 'p'（profiles 欄の見出し）
+  const inS = where === 's', col = inS ? 'collapsed_sessions' : 'collapsed';
+  return [
+    ...(inS ? [] : [mi('o', 'open all (new tabs)', () => run('group.open', { gid: g.id }))]),
+    mi('⏎', g[col] ? 'expand' : 'collapse', () => run('group.update', { gid: g.id, [col]: !g[col] })),
+    ...(inS ? [] : [mi('+', 'add profile here…', () => openSaveForm({ group: g.id }))]),
+    mi('e', 'edit name / color / dirs…', () => openGroupForm({ edit: g })), '-',
+    mi('↑', 'move up', () => run('group.update', { gid: g.id, dir: -1 })),
+    mi('↓', 'move down', () => run('group.update', { gid: g.id, dir: 1 })), '-',
+    mi('d', 'delete group', () => confirmAsk(`delete group ${g.name}? profiles → ungrouped, sessions → by dir`, () => run('group.delete', { gid: g.id })), 'danger'),
+  ];
+}
+function rowMenu(key, x, y) {
+  const k = parseKey(key); if (!k) return;
+  if (ui.multi.size > 1 && ui.multi.has(key)) { const pk = picked(); return showMenu(x, y, multiMenu(pk.kind, pk.ids)); }
+  clearMulti();
+  if (k.kind === 's') { const s = sById(k.id); if (s) showMenu(x, y, sessionMenu(s)); }
+  else { const p = pById(k.id); if (p) showMenu(x, y, profileMenu(p, x, y)); }
+}
+function menuAtRow(key, items) { const b = rowEl(key)?.getBoundingClientRect(); if (b) showMenu(b.left + 20, b.bottom, items); }
+
+/* group form（作成と編集を兼ねる）。dirs = この dir の配下で動くセッションを自動でこのグループに入れる */
+const gfIn = $('#gfIn'), gfDir = $('#gfDir');
+let gf = null;
+function openGroupForm(o = {}) {
+  closeSaveForm();
+  const used = new Set(D.groups.map(g => g.color));
+  const items = o.items && o.items.ids.length ? o.items : null;   // 作った後にこのグループへ移すもの
+  let dirs = o.edit ? [...(o.edit.dirs || [])] : [], taken = [];
+  if (!o.edit && items?.kind === 's') {   // セッションから作る時は、その cwd を dirs の初期値に（別グループの dir と同じものは外す）
+    const cwds = [...new Set(items.ids.map(sById).filter(Boolean).map(s => nk(s.cwd)))];
+    taken = cwds.map(c => [c, D.groups.find(g => (g.dirs || []).some(d => nk(d) === c))]).filter(([, g]) => g);
+    dirs = cwds.filter(c => !taken.some(([t]) => t === c));
+  }
+  gf = { edit: o.edit || null, items, dirs, color: o.edit ? o.edit.color : (GCOLORS.find(c => !used.has(c)) || GCOLORS[0]) };
+  openBox('prof');
+  $('#gfP').textContent = gf.edit ? `edit ${gf.edit.name}>` : 'group>';
+  gfIn.value = gf.edit ? gf.edit.name : ''; gfDir.value = ''; $('#gfErr').textContent = '';
+  const n = items ? items.ids.length : 0;
+  const one = n === 1 ? (items.kind === 's' ? sById(items.ids[0])?.name : pById(items.ids[0])?.name) : '';
+  $('#gfNote').innerHTML = 'sessions under these dirs join automatically' +
+    (n ? `<br>then moves ${esc(one || plural(n, items.kind === 's' ? 'session' : 'profile'))} here` : '') +
+    taken.map(([c, g]) => `<br>${esc(tilde(c))} stays in ${esc(g.name)}'s dirs`).join('');
+  $('#gform').hidden = false; drawSwatches(); drawDirs(); gfHint('name'); gfIn.focus();
+  $('#gform').scrollIntoView({ block: 'nearest' });
+}
+function closeGroupForm() { gf = null; $('#gform').hidden = true; gfIn.blur(); if (comp.el === gfDir) closeComp(); }
+function drawSwatches() {
+  gfIn.className = `col-${gf.color}`;                 // 入力中の名前がそのままプレビューになる
+  $('#gfC').innerHTML = `<span class="faint">color</span>` + GCOLORS.map(c =>
+    `<button data-c="${c}" class="${gf.color === c ? 'on' : ''}" title="${c}"><span class="col-${c}">■</span></button>`).join('');
+}
+function drawDirs() {
+  $('#gfDirs').innerHTML = gf.dirs.map((d, i) =>
+    `<div class="frow"><span class="k">${i ? '' : 'dirs'}</span><span class="dl" title="${esc(d)}">${esc(tilde(d))}</span>` +
+    `<button class="x" data-rm="${i}" title="remove">×</button></div>`).join('');
+  $('#gfDirK').textContent = gf.dirs.length ? '' : 'dirs';
+}
+function addDir() {
+  const v = gfDir.value.trim(); if (!v) return false;
+  const d = nk(v); if (!gf.dirs.includes(d)) gf.dirs.push(d);
+  gfDir.value = ''; closeComp(); drawDirs(); return true;
+}
+function gfHint(where) {
+  $('#gfHint').innerHTML = where === 'dir'
+    ? '<span><kbd>⏎</kbd> add dir (empty: save)</span><span><kbd>tab</kbd> complete</span><span><kbd>esc</kbd> cancel</span>'
+    : '<span><kbd>⏎</kbd> save</span><span><kbd>tab</kbd> color</span><span><kbd>esc</kbd> cancel</span>';
+}
+async function submitGroup() {
+  const name = gfIn.value.trim();
+  if (!name) { $('#gfErr').textContent = 'type a name'; gfIn.focus(); return; }
+  if (gfDir.value.trim()) addDir();                     // 打ちかけの dir も入れる
+  const f = gf;
+  let r;
+  try {
+    r = f.edit ? await src.act('group.update', { gid: f.edit.id, name, color: f.color, dirs: f.dirs })
+               : await src.act('group.create', { name, color: f.color, dirs: f.dirs });
+  } catch (e) { $('#gfErr').textContent = e.message || String(e); return; }
+  closeGroupForm();
+  if (!f.items) return flash(r.msg);
+  // 作ったグループへ移す（既存の op を順に呼ぶ）。dir ルールで既に入ったセッションには手動上書きを作らない
+  const g = await waitFor(() => D.groups.find(x => x.name === name));
+  if (!g) return flash(`created group ${name} — it has not shown up yet, move them again`, 'e');
+  const { kind, ids } = f.items;
+  const todo = kind === 's' ? ids.filter(id => sById(id) && sById(id).group !== g.id) : ids;
+  for (const id of todo) {
+    try { await src.act(kind === 's' ? 'session.move' : 'profile.move', { id, group: g.id }); }
+    catch (e) { return flash(`created group ${name}, but moving failed: ${e.message || e}`, 'e'); }
+  }
+  clearMulti();
+  flash(`created group ${name} · ${plural(ids.length, kind === 's' ? 'session' : 'profile')} in it`);
+}
+gfIn.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.preventDefault(); closeGroupForm(); }
+  else if (e.key === 'Enter') { e.preventDefault(); submitGroup(); }
+  else if (e.key === 'Tab') {
+    e.preventDefault();
+    const i = GCOLORS.indexOf(gf.color);
+    gf.color = GCOLORS[(i + (e.shiftKey ? -1 : 1) + GCOLORS.length) % GCOLORS.length]; drawSwatches();
+  }
+});
+gfIn.addEventListener('focus', () => { if (gf) gfHint('name'); });
+gfDir.addEventListener('focus', () => { if (gf) gfHint('dir'); });
+gfDir.addEventListener('keydown', e => {
+  const inComp = comp.el === gfDir && comp.list.length;
+  if (inComp && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    e.preventDefault();
+    const n = comp.list.length;
+    comp.i = e.key === 'ArrowDown' ? (comp.i + 1 >= n ? -1 : comp.i + 1) : (comp.i <= -1 ? n - 1 : comp.i - 1);
+    drawComp();
+  } else if (e.key === 'Tab') { e.preventDefault(); if (inComp) acceptComp(comp.i >= 0 ? comp.i : 0); }
+  else if (e.key === 'Escape') { e.preventDefault(); if (inComp) closeComp(); else closeGroupForm(); }
+  else if (e.key === 'Enter') { e.preventDefault(); if (inComp && comp.i >= 0) acceptComp(comp.i); else if (!addDir()) submitGroup(); }
+});
+$('#gfDirs').addEventListener('click', e => { const b = e.target.closest('[data-rm]'); if (!b || !gf) return; gf.dirs.splice(+b.dataset.rm, 1); drawDirs(); gfDir.focus(); });
+$('#gfC').addEventListener('click', e => { const b = e.target.closest('[data-c]'); if (!b) return; gf.color = b.dataset.c; drawSwatches(); gfIn.focus(); });
+$('#grpBtn').addEventListener('click', () => $('#gform').hidden ? openGroupForm() : closeGroupForm());
+
+/* save form: 今のタブ（capture）から新規保存／既存 profile の編集 */
+let sf = null;
+const groupOpts = sel => `<span class="faint">group</span>` + [{ id: '', name: 'none', color: '' }, ...D.groups].map(g =>
+  `<button data-group="${esc(g.id)}" class="${sel === g.id ? 'on' : ''}"><span class="${g.id ? `col-${g.color}` : ''}">${esc(g.name)}</span></button>`).join('');
+async function openSaveForm(o = {}) {
+  closeGroupForm(); openBox('prof');
+  let p, err = '';
+  if (o.id) { const x = pById(o.id); if (!x) return; p = JSON.parse(JSON.stringify(x)); }
+  else {
+    const blank = { name: '', left: { cwd: '', cmd: '' }, right: { cwd: '', cmd: '' }, ratio: 50 };
+    try { p = { ...blank, ...(await src.act('capture', { from: o.from || null })).profile }; }
+    catch (e) { p = blank; err = `${e.message || e}`; }
+    p.id = null; p.group = o.group || matchDir(D.groups, p.left.cwd)?.id || '';   // dir ルールに当たればそのグループを初期値に
+  }
+  sf = { id: p.id, group: p.group || '', split: !!p.right, ratio: p.ratio || 50, lastL: p.left.cwd };
+  $('#sfP').textContent = sf.id ? 'edit>' : 'save>';
+  $('#sfName').value = p.name; $('#sfLDir').value = tilde(p.left.cwd); $('#sfLCmd').value = p.left.cmd || '';
+  $('#sfRDir').value = tilde(p.right ? p.right.cwd : p.left.cwd); $('#sfRCmd').value = p.right?.cmd || '';
+  sf.lastL = $('#sfLDir').value;
+  $('#sfErr').textContent = err; closeComp();
+  drawSaveOpts(); $('#sform').hidden = false; $('#sfName').focus(); $('#sfName').select();
+}
+function closeSaveForm() { sf = null; $('#sform').hidden = true; closeComp(); }
+function drawSaveOpts() {
+  $('#sfSplit').innerHTML = `<span class="faint">right</span>` +
+    [['1', 'split'], ['0', 'none']].map(([v, l]) => `<button data-split="${v}" class="${(sf.split ? '1' : '0') === v ? 'on' : ''}">${l}</button>`).join('');
+  $('#sfRight').hidden = !sf.split;
+  const rs = RATIOS.includes(sf.ratio) ? RATIOS : [...RATIOS, sf.ratio].sort((a, b) => a - b);
+  $('#sfRatio').innerHTML = `<span class="faint">ratio</span>` +
+    rs.map(r => `<button data-ratio="${r}" class="${sf.ratio === r ? 'on' : ''}">${r}:${100 - r}</button>`).join('');
+  const el = $('#sfGroup'); el.hidden = !D.groups.length; el.innerHTML = groupOpts(sf.group);
+}
+async function submitSave() {
+  const name = $('#sfName').value.trim(), lcwd = $('#sfLDir').value.trim();
+  if (!name) { $('#sfErr').textContent = 'type a name'; $('#sfName').focus(); return; }
+  if (!lcwd) { $('#sfErr').textContent = 'left dir is required'; $('#sfLDir').focus(); return; }
+  const right = sf.split ? { cwd: $('#sfRDir').value.trim() || lcwd, cmd: $('#sfRCmd').value.trim() } : null;
+  try {
+    const r = await src.act('save', { id: sf.id, name, group: sf.group || null, left: { cwd: lcwd, cmd: $('#sfLCmd').value.trim() }, right, ratio: sf.split ? sf.ratio : null });
+    closeSaveForm(); flash(r.msg);
+  } catch (e) { $('#sfErr').textContent = e.message || String(e); }
+}
+$('#sfSplit').addEventListener('click', e => { const b = e.target.closest('[data-split]'); if (b) { sf.split = b.dataset.split === '1'; drawSaveOpts(); } });
+$('#sfRatio').addEventListener('click', e => { const b = e.target.closest('[data-ratio]'); if (b) { sf.ratio = +b.dataset.ratio; drawSaveOpts(); } });
+$('#sfGroup').addEventListener('click', e => { const b = e.target.closest('[data-group]'); if (b) { sf.group = b.dataset.group; drawSaveOpts(); } });
+$('#sfLDir').addEventListener('input', e => {   // 右の dir が左と同じだったら一緒に追従させる
+  const r = $('#sfRDir'); if (sf && r.value === sf.lastL) r.value = e.target.value;
+  if (sf) sf.lastL = e.target.value;
+});
+
+/* dir 補完（save form の dir 欄と group form の dirs 欄） */
+const comp = { el: null, list: [], i: -1 };
+async function refreshComp(input) {
+  const v = input.value, list = await src.complete(v);
+  if (input.value !== v || document.activeElement !== input) return;   // 入力が先に進んでいたら捨てる
+  comp.el = input; comp.list = list.slice(0, 5); comp.i = -1; drawComp();
+}
+function drawComp() {
+  $$('.sug').forEach(x => { x.innerHTML = ''; });
+  if (!comp.el) return;
+  $(`#${comp.el.dataset.sug}`).innerHTML = comp.list.map((s, i) =>
+    `<div class="${i === comp.i ? 'on' : ''}" data-i="${i}"><span class="pth">${esc(tilde(s.path))}</span><span class="n">${esc(s.note || '')}</span></div>`).join('');
+}
+function closeComp() { comp.el = null; comp.list = []; comp.i = -1; drawComp(); }
+function acceptComp(i) {
+  const s = comp.list[i], inp = comp.el; if (!s || !inp) return;
+  inp.value = tilde(s.path); inp.dispatchEvent(new Event('input')); inp.focus();
+}
+$$('.dirin').forEach(inp => {
+  inp.addEventListener('input', () => refreshComp(inp));
+  inp.addEventListener('focus', () => refreshComp(inp));
+  inp.addEventListener('blur', () => setTimeout(() => { if (comp.el === inp && document.activeElement !== inp) closeComp(); }, 0));
+});
+$$('.sug').forEach(el => el.addEventListener('mousedown', e => { const d = e.target.closest('[data-i]'); if (!d) return; e.preventDefault(); acceptComp(+d.dataset.i); }));
+$('#sform').addEventListener('keydown', e => {
+  if (e.target.tagName !== 'INPUT') return;
+  const inComp = comp.el === e.target && comp.list.length;
+  if (inComp && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    e.preventDefault();
+    const n = comp.list.length;   // -1 = 候補を選んでいない（⏎ で保存）
+    comp.i = e.key === 'ArrowDown' ? (comp.i + 1 >= n ? -1 : comp.i + 1) : (comp.i <= -1 ? n - 1 : comp.i - 1);
+    drawComp();
+  } else if (inComp && e.key === 'Tab') { e.preventDefault(); acceptComp(comp.i >= 0 ? comp.i : 0); }
+  else if (e.key === 'Escape') { e.preventDefault(); if (inComp) closeComp(); else closeSaveForm(); }
+  else if (e.key === 'Enter') { e.preventDefault(); if (inComp && comp.i >= 0) acceptComp(comp.i); else submitSave(); }
+});
+$('#saveBtn').addEventListener('click', () => $('#sform').hidden ? openSaveForm({ from: selected().s?.id }) : closeSaveForm());
+
+/* list events（sessions / profiles 共通）。⇧クリック = 範囲、⌃/⌘クリック = 1 件ずつ（同じ欄の中だけ）
+   macOS の WebKit は ⌃クリックを右クリック扱いにして contextmenu（ctrlKey=true）を出すので、そちらで拾う */
+function bindList(list) {
+  list.addEventListener('mousemove', e => {
+    if (ui.multi.size) return;                          // 複数選択中はカーソルを動かさない（⇧↑↓ の起点を保つ）
+    const r = e.target.closest('[data-key]'); if (r && r.dataset.key !== ui.sel) setSel(r.dataset.key);
+  });
+  list.addEventListener('mousedown', e => {             // 範囲・トグル選択で文字が選択されないように。選択そのものはしない
+    if ((e.shiftKey || e.metaKey || e.ctrlKey) && e.target.closest('[data-key]')) e.preventDefault();
+  });
+  list.addEventListener('click', e => {
+    if (e.target.id === 'rn') return;
+    const gh = e.target.closest('.grp[data-gid]');
+    if (gh) {
+      const g = gById(gh.dataset.gid); if (!g) return;
+      if (e.target.closest('[data-gact="add"]')) return openSaveForm({ group: g.id });
+      const col = gh.dataset.where === 's' ? 'collapsed_sessions' : 'collapsed';
+      return run('group.update', { gid: g.id, [col]: !g[col] });
+    }
+    if (e.target.closest('[data-act="save"]')) return openSaveForm({});
+    const r = e.target.closest('[data-key]'); if (!r) return;
+    if (e.target.closest('[data-act="more"]')) {
+      if (!ui.multi.has(r.dataset.key)) setSel(r.dataset.key);
+      const b = e.target.getBoundingClientRect(); return rowMenu(r.dataset.key, b.left, b.bottom);
+    }
+    if (e.shiftKey) return pick(r.dataset.key, 'range');
+    if (e.ctrlKey || e.metaKey) return pick(r.dataset.key, 'toggle');
+    clearMulti(); ui.anchor = r.dataset.key; activate(r.dataset.key);
+  });
+  list.addEventListener('contextmenu', e => {
+    const r = e.target.closest('[data-key]');
+    if (e.ctrlKey && r) { e.preventDefault(); closeMenu(); return pick(r.dataset.key, 'toggle'); }   // ⌃クリック = トグル（メニューは出さない）
+    const gh = e.target.closest('.grp[data-gid]');
+    if (gh) { e.preventDefault(); const g = gById(gh.dataset.gid); if (g) showMenu(e.clientX, e.clientY, groupMenu(g, gh.dataset.where)); return; }
+    if (!r) return;
+    e.preventDefault();
+    if (!ui.multi.has(r.dataset.key)) setSel(r.dataset.key);
+    rowMenu(r.dataset.key, e.clientX, e.clientY);
+  });
+}
+/* drag: 選択中の行をつかんだら選択全部を運ぶ。sessions は sessions 欄、profiles は profiles 欄のグループにだけ落とせる */
+function bindDrag(list, kind) {
+  list.addEventListener('dragstart', e => {
+    const r = e.target.closest(`[data-kind="${kind}"]`); if (!r) return;
+    const keys = ui.multi.has(r.dataset.key) ? [...ui.multi] : [r.dataset.key];
+    ui.dragging = { kind, ids: keys.map(k => parseKey(k).id) };
+    keys.forEach(k => rowEl(k)?.classList.add('dragging'));
+    list.classList.add('drag-on');
+    e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', ui.dragging.ids.join(' '));
+  });
+  list.addEventListener('dragover', e => {
+    const s = ui.dragging?.kind === kind && e.target.closest('.gsec'); if (!s) return;
+    e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+    $$('.gsec.drop').forEach(x => x !== s && x.classList.remove('drop')); s.classList.add('drop');
+  });
+  list.addEventListener('dragleave', e => { if (!list.contains(e.relatedTarget)) $$('.gsec.drop').forEach(x => x.classList.remove('drop')); });
+  list.addEventListener('drop', e => {
+    const s = e.target.closest('.gsec'), d = ui.dragging; if (!s || !d || d.kind !== kind) return;
+    e.preventDefault(); ui.dragging = null; list.classList.remove('drag-on');
+    $$('.gsec.drop').forEach(x => x.classList.remove('drop'));
+    moveTo(kind, d.ids, s.dataset.gid || null);
+  });
+  list.addEventListener('dragend', () => { list.classList.remove('drag-on'); if (ui.dragging) { ui.dragging = null; render(); } });
+}
+bindList($('#slist')); bindDrag($('#slist'), 's');
+const plist = $('#plist');
+bindList(plist); bindDrag(plist, 'p');
+plist.addEventListener('keydown', e => {
+  if (e.target.id !== 'rn') return;
+  if (e.key === 'Enter') { e.preventDefault(); commitRename(true); }
+  if (e.key === 'Escape') { e.preventDefault(); commitRename(false); }
+});
+plist.addEventListener('focusout', e => { if (e.target.id === 'rn') commitRename(true); });
+
+/* history events */
+$('#hlist').addEventListener('click', e => {
+  const a = e.target.closest('[data-hact]');
+  if (a) {
+    const it = D.history.find(h => h.id === ui.hist); if (!it) return;
+    if (a.dataset.hact === 'copy') { navigator.clipboard?.writeText(it.id).catch(() => {}); return flash(`copied ${it.id.slice(0, 8)}`); }
+    return run('resume', { hid: it.id });
+  }
+  const r = e.target.closest('.hr'); if (!r) return;
+  ui.hist = ui.hist === r.dataset.hid ? null : r.dataset.hid; renderHistory();
+});
+$('#q').addEventListener('input', e => { ui.q = e.target.value; renderHistory(); });
+$('#q').addEventListener('keydown', e => { if (e.key === 'Escape') { e.target.value = ''; ui.q = ''; e.target.blur(); renderHistory(); } });
+$('#scope').addEventListener('click', () => {
+  if (ui.scope !== 'all') return scopeTo('all');
+  const { s, p } = selected(), a = sById(D.active);
+  scopeTo(s?.cwd || p?.left.cwd || a?.cwd || 'all');
+});
+
+/* header / chrome */
+$('#ctrs').addEventListener('click', e => { const b = e.target.closest('[data-jump]'); if (b && !b.classList.contains('zero')) jump(b.dataset.jump); });
+$$('[data-col]').forEach(b => b.addEventListener('click', () => {
+  const box = $(`#${b.dataset.col}`), c = box.classList.toggle('collapsed');
+  b.querySelector('.car').textContent = c ? '▸' : '▾';
+}));
+$('#msg').addEventListener('click', e => { const b = e.target.closest('[data-cf]'); if (!b) return; const y = ui.confirm; flash(''); if (b.dataset.cf === 'y' && y) y(); });
+const help = $('#help');
+$('#helpX').addEventListener('click', () => { help.hidden = true; });
+document.addEventListener('mousedown', e => { if (menuEl && !menuEl.contains(e.target)) closeMenu(); });
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (ui.confirm) {
+    const y = ui.confirm;
+    if (e.key === 'y') { flash(''); y(); } else if (['n', 'N', 'Escape', 'Enter'].includes(e.key)) flash('cancelled', '');
+    e.preventDefault(); return;
+  }
+  const { s, p } = selected();
+  switch (e.key) {
+    case 'ArrowDown': case 'j': if (e.shiftKey) extendSel(1); else { clearMulti(); moveSel(1); } break;
+    case 'ArrowUp': case 'k': if (e.shiftKey) extendSel(-1); else { clearMulti(); moveSel(-1); } break;
+    case 'Enter': { const pk = picked(); if (ui.multi.size > 1 && pk.kind === 'p') openMany(pk.ids); else activate(ui.sel); break; }
+    case 's': openSaveForm({ from: s?.id }); break;
+    case 'e': if (p) openSaveForm({ id: p.id }); break;
+    case 'r': if (p) startRename(p); break;
+    case 'd': { const pk = picked(); if (ui.multi.size > 1 && pk.kind === 'p') deleteMany(pk.ids); else if (p) deleteProfile(p); break; }
+    case 'g': {
+      const pk = picked(); if (!pk.ids.length) break;
+      menuAtRow(ui.multi.size ? [...ui.multi][0] : ui.sel, pk.kind === 's' ? sessMoveItems(pk.ids) : profMoveItems(pk.ids)); break;
+    }
+    case 'G': { const pk = picked(); openGroupForm(pk.ids.length ? { items: pk } : {}); break; }
+    case 'h': scopeTo(s?.cwd || p?.left.cwd || 'all'); break;
+    case '/': openBox('hist'); $('#q').focus(); break;
+    case '?': help.hidden = !help.hidden; break;
+    case 'E': if (MOCK) src.toggleFault(); break;
+    case 'Escape':   // 1 回で 1 段ずつ戻す: メニュー → ヘルプ → 複数選択 → カーソル
+      if (menuEl) closeMenu();
+      else if (!help.hidden) help.hidden = true;
+      else if (ui.multi.size) clearMulti();
+      else setSel(null);
+      break;
+    default: return;
+  }
+  e.preventDefault();
+});
+
+/* ---------- boot ---------- */
+const demo = MOCK ? qs.get('demo') : null;
+if (demo === 'fault') src.setFault();
+if (demo === 'startup') src.startup();
+src.start(d => { D = norm(d); render(); }, f => { net = f; renderHeader(); renderFault(); });
+const pByName = n => D.profiles.find(p => p.name === n);
+if (demo === 'menu') { const p = pByName('Journal'); if (p) { setSel(keyOf('p', p.id)); menuAtRow(ui.sel, profileMenu(p, 40, 300)); } }
+if (demo === 'move') { const p = pByName('acme-3'); if (p) { setSel(keyOf('p', p.id)); menuAtRow(ui.sel, profMoveItems([p.id])); } }
+if (demo === 'help') help.hidden = false;
+if (demo === 'group') openGroupForm();
+if (demo === 'save') openSaveForm({});
+if (demo === 'collapsed') src.mutate(S => { S.groups[0].collapsed = true; });
+if (demo === 'sgroup') src.mutate(S => { S.groups.find(g => g.id === 'notes').collapsed_sessions = true; });
+if (demo === 'gdirs') openGroupForm({ edit: gById('work') });
+const sByDir = d => D.sessions.find(x => trim(x.cwd).endsWith('/' + d));
+if (demo === 'smenu') { const s = sByDir('journal-web'); if (s) { setSel(keyOf('s', s.id)); menuAtRow(ui.sel, sessionMenu(s)); } }
+if (demo === 'multi') {
+  const ks = ['memo', 'side-game'].map(sByDir).filter(Boolean).map(x => keyOf('s', x.id));
+  ui.multi = new Set(ks); ui.anchor = ks[0]; ui.sel = ks[ks.length - 1]; paintSel();
+}
+if (demo === 'hist') { ui.hist = D.history.slice().sort((a, b) => b.started - a.started)[2]?.id; renderHistory(); }
+})();
+</script>
+</body>
+</html>
